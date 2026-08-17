@@ -169,8 +169,14 @@ class parser {
         if (e->length == 0) return fail_string(error::malformed_oid);
 
         std::string out;
-        // The first byte packs two arcs: 40 * first + second.
+        // The first byte packs two arcs: 40 * first + second. A first byte with
+        // the continuation bit set means the packed value exceeds 127 — a
+        // multi-byte first subidentifier, which this parser does not decode.
+        // Splitting it as first/40 and first%40 would silently produce a
+        // different OID, and a parser that reads a different identifier than
+        // its peers is the disagreement this library exists to prevent.
         const std::uint8_t first = e->content[0];
+        if ((first & 0x80) != 0) return fail_string(error::malformed_oid);
         out += std::to_string(first / 40);
         out += '.';
         out += std::to_string(first % 40);

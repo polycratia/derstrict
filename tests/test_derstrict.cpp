@@ -138,6 +138,20 @@ void an_oid_that_ends_mid_arc_is_refused() {
     CHECK(p.failure() == error::malformed_oid);
 }
 
+// A first byte with the continuation bit set is a multi-byte first
+// subidentifier (arc two above 47). Decoding it as 40*x+y would silently
+// produce a different OID — refused instead, because a parser that reads a
+// different identifier than its peers is the disagreement this library exists
+// to prevent.
+void a_multibyte_first_subidentifier_is_refused_not_misread() {
+    // 0x88 0x37 encodes the single subidentifier 1079, i.e. the OID 2.999.
+    const auto data = bytes({0x06, 0x02, 0x88, 0x37});
+    auto p = over(data);
+
+    CHECK(!p.oid().has_value());
+    CHECK(p.failure() == error::malformed_oid);
+}
+
 // Bytes after the outermost element mean somebody else read this document
 // differently from you.
 void trailing_data_is_refused() {
@@ -190,6 +204,7 @@ int main() {
     an_integer_too_wide_for_the_result_type_is_refused();
     reads_an_object_identifier();
     an_oid_that_ends_mid_arc_is_refused();
+    a_multibyte_first_subidentifier_is_refused_not_misread();
     trailing_data_is_refused();
     the_wrong_tag_is_refused_and_the_failure_sticks();
     high_tag_numbers_are_refused_rather_than_guessed();
