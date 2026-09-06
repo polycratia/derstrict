@@ -16,6 +16,61 @@ std::vector<std::uint8_t> bytes(std::initializer_list<int> values) {
 
 parser over(const std::vector<std::uint8_t>& data) { return parser{data.data(), data.size()}; }
 
+// The cursor is the only place that touches memory, so its arithmetic is the
+// bounds check the rest of the library rests on.
+void a_cursor_counts_what_is_left() {
+    const auto data = bytes({1, 2, 3, 4});
+    cursor c{data.data(), data.size()};
+    CHECK(c.remaining() == 4u);
+
+    CHECK(c.byte() == 1u);
+    CHECK(c.remaining() == 3u);
+    CHECK(c.take(3) == data.data() + 1);
+    CHECK(c.remaining() == 0u);
+    CHECK(c.at_end());
+
+    // Reading past the end is a failure, not a wrap-around.
+    CHECK(!c.byte().has_value());
+    CHECK(c.failure() == error::truncated);
+    CHECK(c.remaining() == 0u);
+}
+
+void a_cursor_asked_for_more_than_it_has_does_not_underflow() {
+    const auto data = bytes({1, 2, 3, 4});
+    cursor c{data.data(), data.size()};
+
+    CHECK(c.take(5) == nullptr);
+    CHECK(c.failure() == error::truncated);
+    CHECK(c.remaining() == 0u);  // not four minus five
+    // Sticky: the four bytes that really are there still do not come out.
+    CHECK(!c.byte().has_value());
+
+    // A span the caller described but did not provide is an empty one.
+    cursor absent{nullptr, 16};
+    CHECK(absent.remaining() == 0u);
+    CHECK(absent.take(0) == nullptr);
+    CHECK(!absent.byte().has_value());
+}
+
+void a_parser_says_how_much_is_left() {
+    const auto data = bytes({0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x03, 0x00, 0xFF, 0xFF});
+    auto p = over(data);
+    CHECK(p.remaining() == data.size());
+
+    const auto seq = p.expect(tag::sequence);
+    CHECK(seq.has_value());
+    CHECK(p.remaining() == 0u);
+
+    auto inner = p.into(*seq);
+    CHECK(inner.remaining() == 8u);
+    CHECK(inner.unsigned_integer() == 1u);
+    CHECK(inner.remaining() == 5u);
+
+    // Once a read has failed the rest cannot be read, so nothing remains.
+    CHECK(!inner.expect(tag::sequence).has_value());
+    CHECK(inner.remaining() == 0u);
+}
+
 void reads_a_sequence_of_integers() {
     // SEQUENCE { INTEGER 1, INTEGER 65535 }
     const auto data = bytes({0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x03, 0x00, 0xFF, 0xFF});
@@ -193,6 +248,9 @@ void every_error_has_words() {
 }  // namespace
 
 int main() {
+    a_cursor_counts_what_is_left();
+    a_cursor_asked_for_more_than_it_has_does_not_underflow();
+    a_parser_says_how_much_is_left();
     reads_a_sequence_of_integers();
     indefinite_length_is_refused();
     a_length_written_the_long_way_is_refused();

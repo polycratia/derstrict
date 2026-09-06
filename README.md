@@ -42,7 +42,9 @@ const auto algorithm = inner.oid();
 if (!inner.at_end() || !outer.at_end()) return "trailing data";
 ```
 
-Failures are sticky, so a run of reads can be checked once. `content` points
+Failures are sticky, so a run of reads can be checked once. `remaining()` is the
+exact number of bytes not yet read — it never underflows, and it is zero once a
+read has failed, because a failed parser reads nothing more. `content` points
 into the caller's buffer: nothing is copied and nothing is owned.
 
 Header-only, C++17, no allocation, no exceptions.
@@ -65,13 +67,13 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | tag-length-value reading, strict length rules, `INTEGER` as unsigned 64-bit, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules, `INTEGER` as unsigned 64-bit, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
 | Not yet | `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime`, negative and big integers, string types with their character-set rules, context-specific tags |
 
 ## Development
 
 ```bash
-make test   # 48 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 74 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make demo
 ```
 
@@ -81,3 +83,5 @@ value of this library is in what it declines to accept.
 ## License
 
 MIT
+
+Written by [polycratia](https://polycratia.com).

@@ -81,22 +81,88 @@ struct element {
     [[nodiscard]] bool constructed() const noexcept { return (raw_tag & 0x20) != 0; }
 };
 
-/// A cursor over DER, with a sticky error like every parser should have.
-class parser {
+/// A cursor over a byte span: the only thing here that touches memory.
+///
+/// It keeps the first error and reads nothing afterwards, so a run of reads can
+/// be checked once at the end instead of at every step — the check that gets
+/// skipped is always the one that mattered.
+class cursor {
   public:
-    parser(const std::uint8_t* data, std::size_t size) noexcept : data_(data), size_(size) {}
+    /// A span the caller described but did not provide is an empty one.
+    cursor(const std::uint8_t* data, std::size_t size) noexcept
+        : data_(data), size_(data == nullptr ? 0 : size) {}
 
     [[nodiscard]] bool ok() const noexcept { return error_ == error::none; }
     [[nodiscard]] error failure() const noexcept { return error_; }
+
+    /// Bytes still readable. The subtraction cannot underflow: nothing advances
+    /// the offset without asking `has()` first, so it never passes the size.
+    /// Zero once the cursor has failed, because a failed cursor reads no more.
     [[nodiscard]] std::size_t remaining() const noexcept { return ok() ? size_ - offset_ : 0; }
+
+    /// Whether `count` more bytes can be read. Every read goes through here,
+    /// which is what makes a failure stick.
+    [[nodiscard]] bool has(std::size_t count) const noexcept { return count <= remaining(); }
+
+    [[nodiscard]] std::optional<std::uint8_t> byte() noexcept {
+        if (!has(1)) return fail(error::truncated);
+        return data_[offset_++];
+    }
+
+    /// Take `count` bytes and return where they are, leaving the cursor where
+    /// it was if it cannot. Ask `ok()` rather than testing the pointer, which
+    /// is also null for an empty span.
+    [[nodiscard]] const std::uint8_t* take(std::size_t count) noexcept {
+        if (!has(count)) {
+            (void)fail(error::truncated);
+            return nullptr;
+        }
+        const std::uint8_t* const at = data_ + offset_;
+        offset_ += count;
+        return at;
+    }
+
+    /// Require that nothing follows. Bytes after the last element mean somebody
+    /// else read this span differently from you.
+    [[nodiscard]] bool at_end() noexcept {
+        if (!ok()) return false;
+        if (remaining() != 0) {
+            (void)fail(error::trailing_data);
+            return false;
+        }
+        return true;
+    }
+
+    /// Record a failure. The first one wins: whatever goes wrong afterwards is
+    /// a consequence of it, and the first is what describes the document.
+    std::nullopt_t fail(error e) noexcept {
+        if (error_ == error::none) error_ = e;
+        return std::nullopt;
+    }
+
+  private:
+    const std::uint8_t* data_;
+    std::size_t size_;
+    std::size_t offset_ = 0;
+    error error_ = error::none;
+};
+
+/// A reader for DER elements, over a cursor.
+class parser {
+  public:
+    parser(const std::uint8_t* data, std::size_t size) noexcept : cur_(data, size) {}
+
+    [[nodiscard]] bool ok() const noexcept { return cur_.ok(); }
+    [[nodiscard]] error failure() const noexcept { return cur_.failure(); }
+    [[nodiscard]] std::size_t remaining() const noexcept { return cur_.remaining(); }
 
     /// Read the next element, whatever it is.
     [[nodiscard]] std::optional<element> next() noexcept {
-        if (!ok()) return std::nullopt;
-        if (offset_ >= size_) return fail(error::truncated);
+        const auto raw_tag = cur_.byte();
+        if (!raw_tag) return std::nullopt;
 
         element out{};
-        out.raw_tag = data_[offset_++];
+        out.raw_tag = *raw_tag;
 
         // High-tag-number form (0x1F) is legal DER but no certificate field
         // this parser reaches uses it, so it is refused rather than guessed at.
@@ -104,11 +170,12 @@ class parser {
 
         const auto length = read_length();
         if (!length) return std::nullopt;
-        if (*length > size_ - offset_) return fail(error::truncated);
 
-        out.content = data_ + offset_;
+        const std::uint8_t* const content = cur_.take(*length);
+        if (!ok()) return std::nullopt;
+
+        out.content = content;
         out.length = *length;
-        offset_ += *length;
         return out;
     }
 
@@ -125,14 +192,7 @@ class parser {
 
     /// Require that nothing follows. A document with trailing bytes has been
     /// interpreted by somebody differently from you.
-    [[nodiscard]] bool at_end() noexcept {
-        if (!ok()) return false;
-        if (offset_ != size_) {
-            (void)fail(error::trailing_data);
-            return false;
-        }
-        return true;
-    }
+    [[nodiscard]] bool at_end() noexcept { return cur_.at_end(); }
 
     /// Read an INTEGER as an unsigned 64-bit value, refusing the encodings DER
     /// does not allow.
@@ -201,40 +261,35 @@ class parser {
 
   private:
     [[nodiscard]] std::optional<std::size_t> read_length() noexcept {
-        if (offset_ >= size_) return fail_size(error::truncated);
-        const std::uint8_t first = data_[offset_++];
+        const auto first = cur_.byte();
+        if (!first) return std::nullopt;
 
-        if (first < 0x80) return static_cast<std::size_t>(first);
-        if (first == 0x80) return fail_size(error::indefinite_length);
-        if (first == 0xFF) return fail_size(error::non_minimal_length);
+        if (*first < 0x80) return static_cast<std::size_t>(*first);
+        if (*first == 0x80) return fail_size(error::indefinite_length);
+        if (*first == 0xFF) return fail_size(error::non_minimal_length);
 
-        const std::size_t count = first & 0x7F;
-        if (count > size_ - offset_) return fail_size(error::truncated);
+        const std::size_t count = *first & 0x7F;
         if (count > sizeof(std::size_t)) return fail_size(error::length_too_large);
 
+        const std::uint8_t* const raw = cur_.take(count);
+        if (!ok()) return std::nullopt;
+
         std::size_t value = 0;
-        for (std::size_t i = 0; i < count; ++i) value = (value << 8) | data_[offset_ + i];
-        offset_ += count;
+        for (std::size_t i = 0; i < count; ++i) value = (value << 8) | raw[i];
 
         // DER admits exactly one encoding of a length: the shortest. 0x81 0x05
         // and 0x05 mean the same thing, so only one of them may appear.
         if (value < 0x80) return fail_size(error::non_minimal_length);
-        if (count > 1 && data_[offset_ - count] == 0x00) return fail_size(error::non_minimal_length);
+        if (raw[0] == 0x00) return fail_size(error::non_minimal_length);
         return value;
     }
 
-    std::nullopt_t fail(error e) noexcept {
-        if (error_ == error::none) error_ = e;
-        return std::nullopt;
-    }
+    std::nullopt_t fail(error e) noexcept { return cur_.fail(e); }
     std::optional<std::size_t> fail_size(error e) noexcept { return fail(e); }
     std::optional<std::uint64_t> fail_value(error e) noexcept { return fail(e); }
     std::optional<std::string> fail_string(error e) noexcept { return fail(e); }
 
-    const std::uint8_t* data_;
-    std::size_t size_;
-    std::size_t offset_ = 0;
-    error error_ = error::none;
+    cursor cur_;
 };
 
 }  // namespace derstrict
