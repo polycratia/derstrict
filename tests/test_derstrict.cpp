@@ -1,5 +1,6 @@
 #include "derstrict/derstrict.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <initializer_list>
 #include <vector>
@@ -150,6 +151,27 @@ void a_padded_integer_is_refused() {
     const auto signed_form = bytes({0x02, 0x02, 0x00, 0x80});
     auto q = over(signed_form);
     CHECK(q.unsigned_integer() == 0x80u);
+
+    // The rule belongs to the encoding, not to the result type, so the
+    // big-integer view refuses the same bytes.
+    auto r = over(padded);
+    CHECK(!r.integer().has_value());
+    CHECK(r.failure() == error::padded_integer);
+}
+
+// 0xFF 0x80 and 0x80 are both -128. DER writes the shorter one.
+void a_sign_extended_integer_is_refused() {
+    const auto extended = bytes({0x02, 0x02, 0xFF, 0x80});
+    auto p = over(extended);
+    CHECK(!p.integer().has_value());
+    CHECK(p.failure() == error::sign_extended_integer);
+
+    // The same shape where the 0xFF carries information is fine: -255.
+    const auto minimal = bytes({0x02, 0x02, 0xFF, 0x01});
+    auto q = over(minimal);
+    const auto number = q.integer();
+    CHECK(number.has_value());
+    CHECK(number->magnitude_size() == 1u);
 }
 
 void integer_zero_and_an_empty_integer() {
@@ -172,6 +194,79 @@ void an_integer_too_wide_for_the_result_type_is_refused() {
     auto q = over(too_wide);
     CHECK(!q.unsigned_integer().has_value());
     CHECK(q.failure() == error::length_too_large);
+}
+
+// A number too wide for any result type is still readable as an encoding, and
+// reading it copies nothing: the magnitude is where the caller's bytes are.
+void a_big_integer_view_points_into_the_document() {
+    const auto data = bytes({0x02, 0x09, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
+    auto p = over(data);
+
+    const auto number = p.integer();
+    CHECK(number.has_value());
+    CHECK(!number->negative());
+    CHECK(number->magnitude_size() == 8u);
+    CHECK(number->magnitude() == data.data() + 3);  // past the sign byte, not a copy of it
+    CHECK(p.at_end());
+}
+
+void a_big_integer_view_of_zero_has_no_magnitude() {
+    const auto data = bytes({0x02, 0x01, 0x00});
+    auto p = over(data);
+
+    const auto number = p.integer();
+    CHECK(number.has_value());
+    CHECK(number->is_zero());
+    CHECK(!number->negative());
+    CHECK(number->magnitude_size() == 0u);
+}
+
+// A negative value's magnitude is not in the document — the document holds its
+// two's complement — so it is computed into a buffer the caller owns.
+void a_negative_integer_yields_its_magnitude() {
+    struct testcase {
+        std::vector<std::uint8_t> encoded;
+        std::vector<std::uint8_t> magnitude;
+    };
+    const testcase cases[] = {
+        {bytes({0x02, 0x01, 0xFF}), bytes({0x01})},                 // -1
+        {bytes({0x02, 0x01, 0x80}), bytes({0x80})},                 // -128
+        {bytes({0x02, 0x02, 0xFF, 0x01}), bytes({0xFF})},           // -255, one byte wide
+        {bytes({0x02, 0x02, 0xFF, 0x00}), bytes({0x01, 0x00})},     // -256, two
+        {bytes({0x02, 0x02, 0x80, 0x00}), bytes({0x80, 0x00})},     // -32768
+    };
+
+    for (const auto& c : cases) {
+        auto p = over(c.encoded);
+        const auto number = p.integer();
+        CHECK(number.has_value());
+        CHECK(number->negative());
+        CHECK(number->magnitude() == nullptr);  // nowhere in the document to point at
+        CHECK(number->magnitude_size() == c.magnitude.size());
+
+        std::uint8_t out[8] = {};
+        CHECK(number->magnitude_into(out, sizeof(out)));
+        CHECK(std::equal(c.magnitude.begin(), c.magnitude.end(), out));
+    }
+}
+
+void a_magnitude_does_not_overrun_the_caller_buffer() {
+    const auto data = bytes({0x02, 0x02, 0xFF, 0x00});  // -256, two bytes of magnitude
+    auto p = over(data);
+
+    const auto number = p.integer();
+    CHECK(number.has_value());
+    std::uint8_t one[1] = {0xAA};
+    CHECK(!number->magnitude_into(one, sizeof(one)));
+    CHECK(one[0] == 0xAA);  // refused, not half-written
+}
+
+void a_negative_integer_is_not_an_unsigned_one() {
+    const auto data = bytes({0x02, 0x01, 0xFF});
+    auto p = over(data);
+
+    CHECK(!p.unsigned_integer().has_value());
+    CHECK(p.failure() == error::negative_integer);
 }
 
 void reads_an_object_identifier() {
@@ -240,7 +335,8 @@ void high_tag_numbers_are_refused_rather_than_guessed() {
 void every_error_has_words() {
     for (auto e : {error::truncated, error::indefinite_length, error::non_minimal_length,
                    error::length_too_large, error::unexpected_tag, error::padded_integer,
-                   error::empty_integer, error::malformed_oid, error::trailing_data}) {
+                   error::sign_extended_integer, error::negative_integer, error::empty_integer,
+                   error::malformed_oid, error::trailing_data}) {
         CHECK(describe(e)[0] != '\0');
     }
 }
@@ -258,8 +354,14 @@ int main() {
     a_genuinely_long_length_is_accepted();
     an_element_longer_than_the_document_is_refused();
     a_padded_integer_is_refused();
+    a_sign_extended_integer_is_refused();
     integer_zero_and_an_empty_integer();
     an_integer_too_wide_for_the_result_type_is_refused();
+    a_big_integer_view_points_into_the_document();
+    a_big_integer_view_of_zero_has_no_magnitude();
+    a_negative_integer_yields_its_magnitude();
+    a_magnitude_does_not_overrun_the_caller_buffer();
+    a_negative_integer_is_not_an_unsigned_one();
     reads_an_object_identifier();
     an_oid_that_ends_mid_arc_is_refused();
     a_multibyte_first_subidentifier_is_refused_not_misread();

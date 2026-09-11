@@ -10,7 +10,7 @@
 //
 //   * indefinite lengths      — BER only; a DER document cannot contain one
 //   * non-minimal lengths     — 0x81 0x05 says "five" the long way
-//   * padded integers         — a leading 0x00 that is not a sign byte
+//   * padded integers         — a leading 0x00 or 0xFF the next byte implies
 //   * trailing bytes          — content after the outermost element
 //   * unterminated OID arcs   — a final byte with the continuation bit set
 //
@@ -47,6 +47,8 @@ enum class error {
     length_too_large,
     unexpected_tag,
     padded_integer,
+    sign_extended_integer,
+    negative_integer,
     empty_integer,
     malformed_oid,
     trailing_data,
@@ -61,6 +63,8 @@ enum class error {
         case error::length_too_large: return "the length does not fit in this platform's size type";
         case error::unexpected_tag: return "a different tag was required here";
         case error::padded_integer: return "the integer carries a leading zero that is not a sign byte";
+        case error::sign_extended_integer: return "the integer repeats a sign byte its next byte already implies";
+        case error::negative_integer: return "the integer is negative and an unsigned value was required";
         case error::empty_integer: return "an integer must have at least one content byte";
         case error::malformed_oid: return "the object identifier ends mid-arc";
         case error::trailing_data: return "bytes remain after the element";
@@ -79,6 +83,72 @@ struct element {
         return raw_tag == static_cast<std::uint8_t>(expected);
     }
     [[nodiscard]] bool constructed() const noexcept { return (raw_tag & 0x20) != 0; }
+};
+
+/// An INTEGER's content as DER wrote it: two's complement, big-endian, minimal,
+/// pointing into the caller's buffer.
+///
+/// A non-negative value's magnitude is written down in the document, so
+/// `magnitude()` hands back a pointer to it and copies nothing. A negative
+/// value's is not — the document holds the complement of it — so it has to be
+/// computed, and this library owns no memory: `magnitude_into()` writes it
+/// into a buffer the caller provides.
+struct big_integer {
+    const std::uint8_t* bytes = nullptr;
+    std::size_t size = 0;
+
+    [[nodiscard]] bool negative() const noexcept { return size != 0 && (bytes[0] & 0x80) != 0; }
+    [[nodiscard]] bool is_zero() const noexcept { return size == 1 && bytes[0] == 0x00; }
+
+    /// The bytes of |value|, big-endian and without leading zeros, in place.
+    /// Null for a negative value, whose magnitude appears nowhere in the
+    /// document; `magnitude_into()` is the way to read that one.
+    [[nodiscard]] const std::uint8_t* magnitude() const noexcept {
+        if (size == 0 || negative()) return nullptr;
+        return bytes[0] == 0x00 ? bytes + 1 : bytes;
+    }
+
+    /// How many bytes |value| occupies, for either sign. Zero for the value
+    /// zero, which has no magnitude bytes at all.
+    [[nodiscard]] std::size_t magnitude_size() const noexcept {
+        if (size == 0) return 0;
+        if (!negative()) return bytes[0] == 0x00 ? size - 1 : size;
+        // Negating loses the top byte only when it is 0xFF and the carry out of
+        // the lower bytes never reaches it: 0xFF 0x01 is -255, one byte wide,
+        // while 0xFF 0x00 is -256 and stays two.
+        if (bytes[0] != 0xFF) return size;
+        for (std::size_t i = 1; i < size; ++i) {
+            if (bytes[i] != 0x00) return size - 1;
+        }
+        return size;
+    }
+
+    /// Write |value| big-endian into `out`, for either sign. False, and `out`
+    /// untouched, if it does not hold `magnitude_size()` bytes.
+    [[nodiscard]] bool magnitude_into(std::uint8_t* out, std::size_t capacity) const noexcept {
+        const std::size_t needed = magnitude_size();
+        if (capacity < needed) return false;
+        if (needed == 0) return true;
+        if (out == nullptr) return false;
+
+        if (!negative()) {
+            const std::uint8_t* const from = magnitude();
+            for (std::size_t i = 0; i < needed; ++i) out[i] = from[i];
+            return true;
+        }
+
+        // Two's complement negation, least significant byte first. The dropped
+        // top byte, if there is one, is the zero that negation produces.
+        const std::size_t skipped = size - needed;
+        std::uint8_t carry = 1;
+        for (std::size_t i = size; i-- > 0;) {
+            const unsigned int sum =
+                static_cast<unsigned int>(static_cast<std::uint8_t>(~bytes[i])) + carry;
+            carry = static_cast<std::uint8_t>(sum >> 8);
+            if (i >= skipped) out[i - skipped] = static_cast<std::uint8_t>(sum & 0xFFu);
+        }
+        return true;
+    }
 };
 
 /// A cursor over a byte span: the only thing here that touches memory.
@@ -194,31 +264,28 @@ class parser {
     /// interpreted by somebody differently from you.
     [[nodiscard]] bool at_end() noexcept { return cur_.at_end(); }
 
-    /// Read an INTEGER as an unsigned 64-bit value, refusing the encodings DER
-    /// does not allow.
-    [[nodiscard]] std::optional<std::uint64_t> unsigned_integer() noexcept {
+    /// Read an INTEGER of any width or sign as a view of its encoding. Nothing
+    /// is copied: a serial number stays where the caller put it.
+    [[nodiscard]] std::optional<big_integer> integer() noexcept {
         const auto e = expect(tag::integer);
         if (!e) return std::nullopt;
-        if (e->length == 0) return fail_value(error::empty_integer);
+        if (!minimal(*e)) return std::nullopt;
+        return big_integer{e->content, e->length};
+    }
 
-        std::size_t start = 0;
-        if (e->content[0] == 0x00) {
-            // A single 0x00 is the integer zero. A 0x00 in front of a byte whose
-            // top bit is clear is padding, which DER forbids.
-            if (e->length == 1) return std::uint64_t{0};
-            if ((e->content[1] & 0x80) == 0) return fail_value(error::padded_integer);
-            start = 1;
-        } else if ((e->content[0] & 0x80) != 0) {
-            // Negative in DER's two's complement; not representable here.
-            return fail_value(error::unexpected_tag);
-        }
+    /// Read an INTEGER as an unsigned 64-bit value, refusing the encodings DER
+    /// does not allow and the values this result type cannot hold.
+    [[nodiscard]] std::optional<std::uint64_t> unsigned_integer() noexcept {
+        const auto number = integer();
+        if (!number) return std::nullopt;
+        if (number->negative()) return fail_value(error::negative_integer);
 
-        if (e->length - start > sizeof(std::uint64_t)) return fail_value(error::length_too_large);
+        const std::size_t width = number->magnitude_size();
+        if (width > sizeof(std::uint64_t)) return fail_value(error::length_too_large);
 
+        const std::uint8_t* const from = number->magnitude();
         std::uint64_t value = 0;
-        for (std::size_t i = start; i < e->length; ++i) {
-            value = (value << 8) | e->content[i];
-        }
+        for (std::size_t i = 0; i < width; ++i) value = (value << 8) | from[i];
         return value;
     }
 
@@ -260,6 +327,27 @@ class parser {
     }
 
   private:
+    /// DER writes an integer as the shortest two's complement there is. A
+    /// leading 0x00 is a sign byte only in front of a set top bit, and a
+    /// leading 0xFF is sign extension only in front of a clear one. Either way
+    /// the extra byte is a second encoding of a number that already has one.
+    [[nodiscard]] bool minimal(const element& e) noexcept {
+        if (e.length == 0) {
+            (void)fail(error::empty_integer);
+            return false;
+        }
+        if (e.length == 1) return true;
+        if (e.content[0] == 0x00 && (e.content[1] & 0x80) == 0) {
+            (void)fail(error::padded_integer);
+            return false;
+        }
+        if (e.content[0] == 0xFF && (e.content[1] & 0x80) != 0) {
+            (void)fail(error::sign_extended_integer);
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::size_t> read_length() noexcept {
         const auto first = cur_.byte();
         if (!first) return std::nullopt;

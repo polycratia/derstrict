@@ -23,7 +23,7 @@ bytes after the element    refused: bytes remain after the element
 |---|---|
 | Indefinite length (`0x80`) | BER only. A DER document cannot contain one, and guessing where the element ends is how parsers diverge. |
 | Non-minimal length | `0x81 0x05` and `0x05` mean the same thing. DER allows only the short form, and only one encoding may exist. |
-| Padded integers | A leading `0x00` is a sign byte in front of a high bit, and padding everywhere else. Padding gives one number two encodings. |
+| Padded integers | A leading `0x00` is a sign byte only in front of a set top bit, and a leading `0xFF` is sign extension only in front of a clear one. Anywhere else the byte gives one number two encodings. |
 | Trailing data | Bytes after the outermost element mean somebody else read this document differently from you. |
 | Unterminated OID arcs | A final byte with the continuation bit set. |
 | High-tag-number form | Legal DER, but no field this reaches uses it — refused rather than guessed at. |
@@ -47,6 +47,13 @@ exact number of bytes not yet read — it never underflows, and it is zero once 
 read has failed, because a failed parser reads nothing more. `content` points
 into the caller's buffer: nothing is copied and nothing is owned.
 
+`unsigned_integer()` is for the small fields. `integer()` reads one of any width
+or sign and hands back a view of the encoding: `negative()`, and `magnitude()`
+for a non-negative value's bytes where they already lie. A negative value's
+magnitude is not in the document — the document holds its two's complement — so
+`magnitude_into()` writes that one into a buffer the caller owns, because this
+library owns no memory to write it into.
+
 Header-only, C++17, no allocation, no exceptions.
 
 ## What it is not
@@ -67,13 +74,13 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules, `INTEGER` as unsigned 64-bit, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
-| Not yet | `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime`, negative and big integers, string types with their character-set rules, context-specific tags |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
+| Not yet | `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime`, string types with their character-set rules, context-specific tags |
 
 ## Development
 
 ```bash
-make test   # 74 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 126 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make demo
 ```
 
