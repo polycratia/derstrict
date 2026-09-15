@@ -108,6 +108,18 @@ void a_length_written_the_long_way_is_refused() {
     CHECK(p.failure() == error::non_minimal_length);
 }
 
+// 127 is the largest count the short form carries, so it is also the largest
+// the long form may not carry. The content is present, so the refusal is about
+// the encoding and nothing else.
+void the_largest_short_form_length_may_not_use_the_long_form() {
+    auto data = bytes({0x04, 0x81, 0x7F});
+    data.resize(3 + 127, 0xAA);
+    auto p = over(data);
+
+    CHECK(!p.next().has_value());
+    CHECK(p.failure() == error::non_minimal_length);
+}
+
 void a_long_form_length_with_a_leading_zero_is_refused() {
     // 0x82 0x00 0x80 encodes 128 in two bytes where one would do.
     auto data = bytes({0x04, 0x82, 0x00, 0x80});
@@ -116,6 +128,25 @@ void a_long_form_length_with_a_leading_zero_is_refused() {
 
     CHECK(!p.next().has_value());
     CHECK(p.failure() == error::non_minimal_length);
+}
+
+// 0xFF is reserved by X.690: it announces no byte count at all. Reading it as
+// "127 length bytes follow" would be a parser inventing a meaning.
+void a_reserved_length_byte_is_refused() {
+    const auto data = bytes({0x04, 0xFF, 0x01, 0x02});
+    auto p = over(data);
+
+    CHECK(!p.next().has_value());
+    CHECK(p.failure() == error::reserved_length);
+}
+
+void a_length_wider_than_a_size_type_is_refused() {
+    // 0x89 announces nine length bytes, which no size type here can hold.
+    const auto data = bytes({0x04, 0x89, 0x01, 0, 0, 0, 0, 0, 0, 0, 0});
+    auto p = over(data);
+
+    CHECK(!p.next().has_value());
+    CHECK(p.failure() == error::length_too_large);
 }
 
 void a_genuinely_long_length_is_accepted() {
@@ -130,12 +161,51 @@ void a_genuinely_long_length_is_accepted() {
     CHECK(p.at_end());
 }
 
+void a_zero_length_element_reads_no_content() {
+    const auto data = bytes({0x05, 0x00});
+    auto p = over(data);
+
+    const auto e = p.next();
+    CHECK(e.has_value());
+    CHECK(e->length == 0u);
+    CHECK(p.at_end());
+}
+
 void an_element_longer_than_the_document_is_refused() {
     const auto data = bytes({0x04, 0x10, 0x01, 0x02});
     auto p = over(data);
 
     CHECK(!p.next().has_value());
     CHECK(p.failure() == error::truncated);
+}
+
+// The length is measured against the document before any content is read, so a
+// count in the millions costs nothing and moves nothing.
+void a_length_far_past_the_end_is_refused_before_the_content() {
+    const auto data = bytes({0x04, 0x84, 0x7F, 0xFF, 0xFF, 0xFF, 0xAA, 0xAA});
+    auto p = over(data);
+
+    CHECK(!p.next().has_value());
+    CHECK(p.failure() == error::truncated);
+    CHECK(p.remaining() == 0u);
+}
+
+// A length is bounded by the element that contains it, not by the document. An
+// inner element reaching past its parent is the classic overrun, and the bytes
+// it reaches for really are present in the outer buffer.
+void an_inner_length_cannot_reach_past_its_parent() {
+    // SEQUENCE of three bytes holding an INTEGER that claims five.
+    const auto data = bytes({0x30, 0x03, 0x02, 0x05, 0x01, 0xAA, 0xAA, 0xAA, 0xAA});
+    auto p = over(data);
+
+    const auto seq = p.expect(tag::sequence);
+    CHECK(seq.has_value());
+    CHECK(p.remaining() == 4u);  // the bytes the inner element wanted are there
+
+    auto inner = p.into(*seq);
+    CHECK(!inner.integer().has_value());
+    CHECK(inner.failure() == error::truncated);
+    CHECK(inner.remaining() == 0u);
 }
 
 // A leading zero is a sign byte only in front of a byte whose top bit is set.
@@ -334,9 +404,9 @@ void high_tag_numbers_are_refused_rather_than_guessed() {
 
 void every_error_has_words() {
     for (auto e : {error::truncated, error::indefinite_length, error::non_minimal_length,
-                   error::length_too_large, error::unexpected_tag, error::padded_integer,
-                   error::sign_extended_integer, error::negative_integer, error::empty_integer,
-                   error::malformed_oid, error::trailing_data}) {
+                   error::reserved_length, error::length_too_large, error::unexpected_tag,
+                   error::padded_integer, error::sign_extended_integer, error::negative_integer,
+                   error::empty_integer, error::malformed_oid, error::trailing_data}) {
         CHECK(describe(e)[0] != '\0');
     }
 }
@@ -350,9 +420,15 @@ int main() {
     reads_a_sequence_of_integers();
     indefinite_length_is_refused();
     a_length_written_the_long_way_is_refused();
+    the_largest_short_form_length_may_not_use_the_long_form();
     a_long_form_length_with_a_leading_zero_is_refused();
+    a_reserved_length_byte_is_refused();
+    a_length_wider_than_a_size_type_is_refused();
     a_genuinely_long_length_is_accepted();
+    a_zero_length_element_reads_no_content();
     an_element_longer_than_the_document_is_refused();
+    a_length_far_past_the_end_is_refused_before_the_content();
+    an_inner_length_cannot_reach_past_its_parent();
     a_padded_integer_is_refused();
     a_sign_extended_integer_is_refused();
     integer_zero_and_an_empty_integer();

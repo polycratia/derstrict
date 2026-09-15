@@ -23,6 +23,8 @@ bytes after the element    refused: bytes remain after the element
 |---|---|
 | Indefinite length (`0x80`) | BER only. A DER document cannot contain one, and guessing where the element ends is how parsers diverge. |
 | Non-minimal length | `0x81 0x05` and `0x05` mean the same thing. DER allows only the short form, and only one encoding may exist. |
+| Reserved length (`0xFF`) | X.690 reserves it, so it announces no byte count at all. Reading it as "127 length bytes follow" would be a parser inventing a meaning. |
+| A length past the end | Measured against the enclosing element before any content is read, so an inner element cannot reach into bytes its parent does not cover. |
 | Padded integers | A leading `0x00` is a sign byte only in front of a set top bit, and a leading `0xFF` is sign extension only in front of a clear one. Anywhere else the byte gives one number two encodings. |
 | Trailing data | Bytes after the outermost element mean somebody else read this document differently from you. |
 | Unterminated OID arcs | A final byte with the continuation bit set. |
@@ -74,13 +76,13 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
 | Not yet | `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime`, string types with their character-set rules, context-specific tags |
 
 ## Development
 
 ```bash
-make test   # 126 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 144 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make demo
 ```
 

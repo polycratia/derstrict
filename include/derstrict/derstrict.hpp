@@ -10,6 +10,7 @@
 //
 //   * indefinite lengths      — BER only; a DER document cannot contain one
 //   * non-minimal lengths     — 0x81 0x05 says "five" the long way
+//   * lengths past the end    — refused before a content byte is read
 //   * padded integers         — a leading 0x00 or 0xFF the next byte implies
 //   * trailing bytes          — content after the outermost element
 //   * unterminated OID arcs   — a final byte with the continuation bit set
@@ -44,6 +45,7 @@ enum class error {
     truncated,
     indefinite_length,
     non_minimal_length,
+    reserved_length,
     length_too_large,
     unexpected_tag,
     padded_integer,
@@ -60,6 +62,7 @@ enum class error {
         case error::truncated: return "the element claims more bytes than the document holds";
         case error::indefinite_length: return "indefinite length is BER, not DER";
         case error::non_minimal_length: return "the length is encoded the long way";
+        case error::reserved_length: return "0xFF is reserved and encodes no length at all";
         case error::length_too_large: return "the length does not fit in this platform's size type";
         case error::unexpected_tag: return "a different tag was required here";
         case error::padded_integer: return "the integer carries a leading zero that is not a sign byte";
@@ -238,6 +241,8 @@ class parser {
         // this parser reaches uses it, so it is refused rather than guessed at.
         if ((out.raw_tag & 0x1F) == 0x1F) return fail(error::unexpected_tag);
 
+        // The length is settled before a content byte is touched: what comes
+        // back from here is a count this span can already cover.
         const auto length = read_length();
         if (!length) return std::nullopt;
 
@@ -348,27 +353,39 @@ class parser {
         return true;
     }
 
+    /// Read a length and decide it entirely: form, minimality, and whether this
+    /// span can cover the count. A value coming back from here is a length that
+    /// has already been checked against the bytes that are really present.
     [[nodiscard]] std::optional<std::size_t> read_length() noexcept {
         const auto first = cur_.byte();
         if (!first) return std::nullopt;
 
-        if (*first < 0x80) return static_cast<std::size_t>(*first);
-        if (*first == 0x80) return fail_size(error::indefinite_length);
-        if (*first == 0xFF) return fail_size(error::non_minimal_length);
+        std::size_t value = *first;
+        if (*first >= 0x80) {
+            if (*first == 0x80) return fail_size(error::indefinite_length);
+            // 0xFF would announce 127 length bytes, but X.690 reserves it, so
+            // it announces nothing and reading one would be an invention.
+            if (*first == 0xFF) return fail_size(error::reserved_length);
 
-        const std::size_t count = *first & 0x7F;
-        if (count > sizeof(std::size_t)) return fail_size(error::length_too_large);
+            const std::size_t count = *first & 0x7F;
+            if (count > sizeof(std::size_t)) return fail_size(error::length_too_large);
 
-        const std::uint8_t* const raw = cur_.take(count);
-        if (!ok()) return std::nullopt;
+            const std::uint8_t* const raw = cur_.take(count);
+            if (!ok()) return std::nullopt;
 
-        std::size_t value = 0;
-        for (std::size_t i = 0; i < count; ++i) value = (value << 8) | raw[i];
+            value = 0;
+            for (std::size_t i = 0; i < count; ++i) value = (value << 8) | raw[i];
 
-        // DER admits exactly one encoding of a length: the shortest. 0x81 0x05
-        // and 0x05 mean the same thing, so only one of them may appear.
-        if (value < 0x80) return fail_size(error::non_minimal_length);
-        if (raw[0] == 0x00) return fail_size(error::non_minimal_length);
+            // DER admits exactly one encoding of a length: the shortest. 0x81
+            // 0x05 and 0x05 both say five, so a count below 128 may not use the
+            // long form, and a long form may not open with a padding byte.
+            if (raw[0] == 0x00 || value < 0x80) return fail_size(error::non_minimal_length);
+        }
+
+        // Checked against the enclosing span before any content is read, so an
+        // element that claims more than its parent holds is refused on sight
+        // rather than after the bytes have been handed out.
+        if (!cur_.has(value)) return fail_size(error::truncated);
         return value;
     }
 
