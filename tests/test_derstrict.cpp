@@ -358,6 +358,106 @@ void an_oid_that_ends_mid_arc_is_refused() {
     CHECK(p.failure() == error::malformed_oid);
 }
 
+// An arc is a base-128 number, and base 128 has no leading zero digit any more
+// than base ten does. A 0x80 opening one is padding, and padding is a second
+// encoding of an identifier that already has one.
+void an_oid_arc_written_the_long_way_is_refused() {
+    // 840 as 0x80 0x86 0x48 rather than 0x86 0x48.
+    const auto first_arc = bytes({0x06, 0x04, 0x2A, 0x80, 0x86, 0x48});
+    auto p = over(first_arc);
+    CHECK(!p.oid().has_value());
+    CHECK(p.failure() == error::non_minimal_oid_arc);
+
+    // The same padding in an arc that is not the first one.
+    const auto later_arc = bytes({0x06, 0x05, 0x2A, 0x86, 0x48, 0x80, 0x01});
+    auto q = over(later_arc);
+    CHECK(!q.oid().has_value());
+    CHECK(q.failure() == error::non_minimal_oid_arc);
+
+    // The same identifier written the one way DER allows.
+    const auto minimal = bytes({0x06, 0x04, 0x2A, 0x86, 0x48, 0x01});
+    auto r = over(minimal);
+    const auto oid = r.oid();
+    CHECK(oid.has_value());
+    CHECK(*oid == "1.2.840.1");
+}
+
+// The first content byte counts the bits the last one does not use, so the
+// value is the bytes after it.
+void reads_a_bit_string() {
+    // 05 A0: three bits, 101, the shape a KeyUsage is written in.
+    const auto data = bytes({0x03, 0x02, 0x05, 0xA0});
+    auto p = over(data);
+
+    const auto value = p.bits();
+    CHECK(value.has_value());
+    CHECK(value->unused == 5u);
+    CHECK(value->size == 1u);
+    CHECK(value->bytes == data.data() + 3);  // a view, not a copy
+    CHECK(value->bit_count() == 3u);
+    CHECK(value->bit(0));
+    CHECK(!value->bit(1));
+    CHECK(value->bit(2));
+    CHECK(!value->bit(3));  // past the last bit, not into the padding
+    CHECK(p.at_end());
+}
+
+void an_empty_bit_string_holds_no_bits() {
+    const auto data = bytes({0x03, 0x01, 0x00});
+    auto p = over(data);
+
+    const auto value = p.bits();
+    CHECK(value.has_value());
+    CHECK(value->empty());
+    CHECK(value->size == 0u);
+    CHECK(value->bit_count() == 0u);
+    CHECK(!value->bit(0));
+    CHECK(p.at_end());
+}
+
+void a_bit_string_without_its_unused_bits_byte_is_refused() {
+    const auto data = bytes({0x03, 0x00});
+    auto p = over(data);
+
+    CHECK(!p.bits().has_value());
+    CHECK(p.failure() == error::missing_unused_bits);
+}
+
+// The count is of bits left over in one byte, so eight of them counts a byte
+// that is not there.
+void more_than_seven_unused_bits_is_refused() {
+    const auto data = bytes({0x03, 0x02, 0x08, 0x00});
+    auto p = over(data);
+
+    CHECK(!p.bits().has_value());
+    CHECK(p.failure() == error::unused_bits_out_of_range);
+}
+
+// With nothing after the count there is no final byte to leave bits unused in.
+void an_empty_bit_string_may_not_leave_bits_unused() {
+    const auto data = bytes({0x03, 0x01, 0x03});
+    auto p = over(data);
+
+    CHECK(!p.bits().has_value());
+    CHECK(p.failure() == error::unused_bits_without_content);
+}
+
+// Unused bits that carry anything are room for two parsers to read one bit
+// string differently.
+void unused_bits_that_carry_a_value_are_refused() {
+    const auto data = bytes({0x03, 0x02, 0x05, 0xA1});
+    auto p = over(data);
+    CHECK(!p.bits().has_value());
+    CHECK(p.failure() == error::non_zero_unused_bits);
+
+    // Seven unused bits are fine when they really are unused.
+    const auto one_bit = bytes({0x03, 0x02, 0x07, 0x80});
+    auto q = over(one_bit);
+    const auto value = q.bits();
+    CHECK(value.has_value());
+    CHECK(value->bit_count() == 1u);
+}
+
 // A first byte with the continuation bit set is a multi-byte first
 // subidentifier (arc two above 47). Decoding it as 40*x+y would silently
 // produce a different OID — refused instead, because a parser that reads a
@@ -406,7 +506,10 @@ void every_error_has_words() {
     for (auto e : {error::truncated, error::indefinite_length, error::non_minimal_length,
                    error::reserved_length, error::length_too_large, error::unexpected_tag,
                    error::padded_integer, error::sign_extended_integer, error::negative_integer,
-                   error::empty_integer, error::malformed_oid, error::trailing_data}) {
+                   error::empty_integer, error::malformed_oid, error::non_minimal_oid_arc,
+                   error::missing_unused_bits, error::unused_bits_out_of_range,
+                   error::unused_bits_without_content, error::non_zero_unused_bits,
+                   error::trailing_data}) {
         CHECK(describe(e)[0] != '\0');
     }
 }
@@ -440,6 +543,13 @@ int main() {
     a_negative_integer_is_not_an_unsigned_one();
     reads_an_object_identifier();
     an_oid_that_ends_mid_arc_is_refused();
+    an_oid_arc_written_the_long_way_is_refused();
+    reads_a_bit_string();
+    an_empty_bit_string_holds_no_bits();
+    a_bit_string_without_its_unused_bits_byte_is_refused();
+    more_than_seven_unused_bits_is_refused();
+    an_empty_bit_string_may_not_leave_bits_unused();
+    unused_bits_that_carry_a_value_are_refused();
     a_multibyte_first_subidentifier_is_refused_not_misread();
     trailing_data_is_refused();
     the_wrong_tag_is_refused_and_the_failure_sticks();

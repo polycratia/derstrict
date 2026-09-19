@@ -28,6 +28,8 @@ bytes after the element    refused: bytes remain after the element
 | Padded integers | A leading `0x00` is a sign byte only in front of a set top bit, and a leading `0xFF` is sign extension only in front of a clear one. Anywhere else the byte gives one number two encodings. |
 | Trailing data | Bytes after the outermost element mean somebody else read this document differently from you. |
 | Unterminated OID arcs | A final byte with the continuation bit set. |
+| Padded OID arcs | An arc is a base-128 number, and base 128 has no leading zero digit any more than base ten does: `0x80 0x01` and `0x01` are one arc written two ways. |
+| A dishonest unused-bits count | It counts the bits the last byte of a `BIT STRING` does not use, so it is at most seven, it is zero when there is no last byte, and the bits it counts are zero. |
 | High-tag-number form | Legal DER, but no field this reaches uses it — refused rather than guessed at. |
 
 ## Use
@@ -56,6 +58,10 @@ magnitude is not in the document — the document holds its two's complement —
 `magnitude_into()` writes that one into a buffer the caller owns, because this
 library owns no memory to write it into.
 
+`bits()` reads a `BIT STRING` as the bytes after its unused-bits count, with
+`bit()` numbering them the way X.690 does: most significant bit of the first
+byte first.
+
 Header-only, C++17, no allocation, no exceptions.
 
 ## What it is not
@@ -76,13 +82,13 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form, descent into constructed elements, end-of-input enforcement |
-| Not yet | `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime`, string types with their character-set rules, context-specific tags |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, descent into constructed elements, end-of-input enforcement |
+| Not yet | `UTCTime` and `GeneralizedTime`, string types with their character-set rules, context-specific tags |
 
 ## Development
 
 ```bash
-make test   # 144 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 181 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make demo
 ```
 

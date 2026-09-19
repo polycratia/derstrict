@@ -14,6 +14,8 @@
 //   * padded integers         — a leading 0x00 or 0xFF the next byte implies
 //   * trailing bytes          — content after the outermost element
 //   * unterminated OID arcs   — a final byte with the continuation bit set
+//   * non-minimal OID arcs    — 0x80 0x01 pads an arc that already fits
+//   * lying unused-bit counts — a bit string that leaves set bits unused
 //
 // Header-only, C++17, no allocation, no exceptions.
 #ifndef DERSTRICT_DERSTRICT_HPP
@@ -53,6 +55,11 @@ enum class error {
     negative_integer,
     empty_integer,
     malformed_oid,
+    non_minimal_oid_arc,
+    missing_unused_bits,
+    unused_bits_out_of_range,
+    unused_bits_without_content,
+    non_zero_unused_bits,
     trailing_data,
 };
 
@@ -70,6 +77,11 @@ enum class error {
         case error::negative_integer: return "the integer is negative and an unsigned value was required";
         case error::empty_integer: return "an integer must have at least one content byte";
         case error::malformed_oid: return "the object identifier ends mid-arc";
+        case error::non_minimal_oid_arc: return "an object identifier arc carries a leading padding byte";
+        case error::missing_unused_bits: return "the bit string has no unused-bits byte";
+        case error::unused_bits_out_of_range: return "a bit string cannot leave more than seven bits unused";
+        case error::unused_bits_without_content: return "an empty bit string leaves unused bits that are not there";
+        case error::non_zero_unused_bits: return "the bit string's unused bits are not zero";
         case error::trailing_data: return "bytes remain after the element";
     }
     return "unknown";
@@ -151,6 +163,25 @@ struct big_integer {
             if (i >= skipped) out[i - skipped] = static_cast<std::uint8_t>(sum & 0xFFu);
         }
         return true;
+    }
+};
+
+/// A BIT STRING's content as DER wrote it, pointing into the caller's buffer.
+/// `bytes` is what follows the unused-bits byte, and `unused` is how many bits
+/// of the last of them are not part of the value.
+struct bit_string {
+    const std::uint8_t* bytes = nullptr;
+    std::size_t size = 0;
+    std::uint8_t unused = 0;
+
+    [[nodiscard]] bool empty() const noexcept { return size == 0; }
+    [[nodiscard]] std::size_t bit_count() const noexcept { return size * 8 - unused; }
+
+    /// Bit `index` counted from the most significant bit of the first byte,
+    /// which is the order X.690 numbers them in. False past the last bit.
+    [[nodiscard]] bool bit(std::size_t index) const noexcept {
+        if (index >= bit_count()) return false;
+        return (bytes[index / 8] & (0x80u >> (index % 8))) != 0;
     }
 };
 
@@ -294,6 +325,31 @@ class parser {
         return value;
     }
 
+    /// Read a BIT STRING as a view of the bytes after its unused-bits count.
+    [[nodiscard]] std::optional<bit_string> bits() noexcept {
+        const auto e = expect(tag::bit_string);
+        if (!e) return std::nullopt;
+        // The first content byte is the count of unused bits, so a BIT STRING
+        // with no content byte has not said how many bits it holds.
+        if (e->length == 0) return fail_bits(error::missing_unused_bits);
+
+        const std::uint8_t unused = e->content[0];
+        // The count is of bits left over in one byte, so eight of them names a
+        // byte that would not be there.
+        if (unused > 7) return fail_bits(error::unused_bits_out_of_range);
+        // With nothing after the count there is no final byte to leave bits
+        // unused in, so any count but zero describes bits that do not exist.
+        if (e->length == 1 && unused != 0) return fail_bits(error::unused_bits_without_content);
+        // X.690 11.2.1: the unused bits are zero. Left to carry anything they
+        // give one bit string a second encoding, which is room for two parsers
+        // to read the same value differently.
+        if (unused != 0 && (e->content[e->length - 1] & ((1u << unused) - 1u)) != 0) {
+            return fail_bits(error::non_zero_unused_bits);
+        }
+
+        return bit_string{e->content + 1, e->length - 1, unused};
+    }
+
     /// Read an OBJECT IDENTIFIER in dotted form.
     [[nodiscard]] std::optional<std::string> oid() noexcept {
         const auto e = expect(tag::object_identifier);
@@ -317,6 +373,10 @@ class parser {
         bool in_arc = false;
         for (std::size_t i = 1; i < e->length; ++i) {
             const std::uint8_t byte = e->content[i];
+            // A subidentifier is base 128, and base 128 has no leading zero
+            // digit any more than base ten does: 0x80 opening one pads a value
+            // that already has an encoding.
+            if (!in_arc && byte == 0x80) return fail_string(error::non_minimal_oid_arc);
             if (arc > (UINT64_MAX >> 7)) return fail_string(error::length_too_large);
             arc = (arc << 7) | (byte & 0x7F);
             in_arc = (byte & 0x80) != 0;
@@ -393,6 +453,7 @@ class parser {
     std::optional<std::size_t> fail_size(error e) noexcept { return fail(e); }
     std::optional<std::uint64_t> fail_value(error e) noexcept { return fail(e); }
     std::optional<std::string> fail_string(error e) noexcept { return fail(e); }
+    std::optional<bit_string> fail_bits(error e) noexcept { return fail(e); }
 
     cursor cur_;
 };
