@@ -16,6 +16,7 @@
 //   * unterminated OID arcs   — a final byte with the continuation bit set
 //   * non-minimal OID arcs    — 0x80 0x01 pads an arc that already fits
 //   * lying unused-bit counts — a bit string that leaves set bits unused
+//   * unsorted set elements   — DER sorts a set's elements by their encodings
 //
 // Header-only, C++17, no allocation, no exceptions.
 #ifndef DERSTRICT_DERSTRICT_HPP
@@ -60,6 +61,7 @@ enum class error {
     unused_bits_out_of_range,
     unused_bits_without_content,
     non_zero_unused_bits,
+    unsorted_set,
     trailing_data,
 };
 
@@ -82,6 +84,7 @@ enum class error {
         case error::unused_bits_out_of_range: return "a bit string cannot leave more than seven bits unused";
         case error::unused_bits_without_content: return "an empty bit string leaves unused bits that are not there";
         case error::non_zero_unused_bits: return "the bit string's unused bits are not zero";
+        case error::unsorted_set: return "the set's elements are not in the order DER requires";
         case error::trailing_data: return "bytes remain after the element";
     }
     return "unknown";
@@ -93,11 +96,19 @@ struct element {
     std::uint8_t raw_tag = 0;
     const std::uint8_t* content = nullptr;
     std::size_t length = 0;
+    std::size_t header = 0;
 
     [[nodiscard]] bool is(tag expected) const noexcept {
         return raw_tag == static_cast<std::uint8_t>(expected);
     }
     [[nodiscard]] bool constructed() const noexcept { return (raw_tag & 0x20) != 0; }
+
+    /// The element as it was written, tag and length bytes included: DER orders
+    /// a SET by these bytes and not by the values behind them.
+    [[nodiscard]] const std::uint8_t* encoding() const noexcept {
+        return content == nullptr ? nullptr : content - header;
+    }
+    [[nodiscard]] std::size_t encoded_size() const noexcept { return header + length; }
 };
 
 /// An INTEGER's content as DER wrote it: two's complement, big-endian, minimal,
@@ -204,6 +215,9 @@ class cursor {
     /// Zero once the cursor has failed, because a failed cursor reads no more.
     [[nodiscard]] std::size_t remaining() const noexcept { return ok() ? size_ - offset_ : 0; }
 
+    /// How many bytes have been read, counted from the start of the span.
+    [[nodiscard]] std::size_t position() const noexcept { return offset_; }
+
     /// Whether `count` more bytes can be read. Every read goes through here,
     /// which is what makes a failure stick.
     [[nodiscard]] bool has(std::size_t count) const noexcept { return count <= remaining(); }
@@ -260,8 +274,14 @@ class parser {
     [[nodiscard]] error failure() const noexcept { return cur_.failure(); }
     [[nodiscard]] std::size_t remaining() const noexcept { return cur_.remaining(); }
 
+    /// Whether another element is there: bytes left, and nothing has refused
+    /// yet. A walk driven by this ends where the content ends, so bytes left
+    /// over after the last element meet a read rather than being stepped over.
+    [[nodiscard]] bool more() const noexcept { return ok() && remaining() != 0; }
+
     /// Read the next element, whatever it is.
     [[nodiscard]] std::optional<element> next() noexcept {
+        const std::size_t start = cur_.position();
         const auto raw_tag = cur_.byte();
         if (!raw_tag) return std::nullopt;
 
@@ -276,12 +296,15 @@ class parser {
         // back from here is a count this span can already cover.
         const auto length = read_length();
         if (!length) return std::nullopt;
+        out.header = cur_.position() - start;
 
         const std::uint8_t* const content = cur_.take(*length);
         if (!ok()) return std::nullopt;
 
         out.content = content;
         out.length = *length;
+
+        if (sorted_ && !in_order(out)) return std::nullopt;
         return out;
     }
 
@@ -293,8 +316,27 @@ class parser {
         return found;
     }
 
-    /// Descend into a constructed element.
-    [[nodiscard]] parser into(const element& e) const noexcept { return parser{e.content, e.length}; }
+    /// Descend into a constructed element. A SET's children carry DER's
+    /// ordering rule with them, so a descent written by hand is no less strict
+    /// than one that went through `set()`.
+    [[nodiscard]] parser into(const element& e) const noexcept {
+        return parser{e.content, e.length, e.is(tag::set)};
+    }
+
+    /// Read a SEQUENCE and hand back a reader over its children.
+    [[nodiscard]] std::optional<parser> sequence() noexcept {
+        const auto e = expect(tag::sequence);
+        if (!e) return std::nullopt;
+        return into(*e);
+    }
+
+    /// Read a SET and hand back a reader over its children, which have to
+    /// arrive in the order DER sorts them into.
+    [[nodiscard]] std::optional<parser> set() noexcept {
+        const auto e = expect(tag::set);
+        if (!e) return std::nullopt;
+        return into(*e);
+    }
 
     /// Require that nothing follows. A document with trailing bytes has been
     /// interpreted by somebody differently from you.
@@ -392,6 +434,46 @@ class parser {
     }
 
   private:
+    parser(const std::uint8_t* data, std::size_t size, bool sorted) noexcept
+        : cur_(data, size), sorted_(sorted) {}
+
+    /// DER sorts a SET's elements by their encodings, so each one is measured
+    /// against the one before it while both are still in reach. Equal
+    /// encodings are in order: sorting does not forbid a repeat, and whether a
+    /// repeated value means anything is the schema's business, not the
+    /// encoding's.
+    [[nodiscard]] bool in_order(const element& e) noexcept {
+        const std::uint8_t* const encoding = e.encoding();
+        const std::size_t width = e.encoded_size();
+        if (previous_ != nullptr && set_order(previous_, previous_size_, encoding, width) > 0) {
+            (void)fail(error::unsorted_set);
+            return false;
+        }
+        previous_ = encoding;
+        previous_size_ = width;
+        return true;
+    }
+
+    /// Compare two elements the way X.690 11.6 orders a set: as octet strings,
+    /// the shorter one padded at its trailing end with zero bytes.
+    [[nodiscard]] static int set_order(const std::uint8_t* a, std::size_t a_size,
+                                      const std::uint8_t* b, std::size_t b_size) noexcept {
+        const std::size_t shared = a_size < b_size ? a_size : b_size;
+        for (std::size_t i = 0; i < shared; ++i) {
+            if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+        }
+        // Past the shorter one the padding is zero, so the longer one is the
+        // greater at the first byte it has left that is not zero, and they are
+        // equal if it has none.
+        const bool a_longer = a_size > b_size;
+        const std::uint8_t* const rest = (a_longer ? a : b) + shared;
+        const std::size_t rest_size = (a_longer ? a_size : b_size) - shared;
+        for (std::size_t i = 0; i < rest_size; ++i) {
+            if (rest[i] != 0x00) return a_longer ? 1 : -1;
+        }
+        return 0;
+    }
+
     /// DER writes an integer as the shortest two's complement there is. A
     /// leading 0x00 is a sign byte only in front of a set top bit, and a
     /// leading 0xFF is sign extension only in front of a clear one. Either way
@@ -456,6 +538,9 @@ class parser {
     std::optional<bit_string> fail_bits(error e) noexcept { return fail(e); }
 
     cursor cur_;
+    const std::uint8_t* previous_ = nullptr;
+    std::size_t previous_size_ = 0;
+    bool sorted_ = false;
 };
 
 }  // namespace derstrict
