@@ -509,7 +509,7 @@ void every_error_has_words() {
                    error::empty_integer, error::malformed_oid, error::non_minimal_oid_arc,
                    error::missing_unused_bits, error::unused_bits_out_of_range,
                    error::unused_bits_without_content, error::non_zero_unused_bits,
-                   error::trailing_data}) {
+                   error::unsorted_set, error::trailing_data}) {
         CHECK(describe(e)[0] != '\0');
     }
 }

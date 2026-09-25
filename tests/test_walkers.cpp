@@ -121,6 +121,24 @@ void a_set_out_of_order_is_refused() {
     CHECK(children.failure() == error::unsorted_set);
 }
 
+// Each element is measured against the one before it, not against the first, so
+// a set that starts in order does not earn the rest of the walk.
+void ordering_is_measured_against_the_element_before() {
+    // SET { INTEGER 1, INTEGER 3, INTEGER 2 }
+    const auto data = bytes({0x31, 0x09, 0x02, 0x01, 0x01, 0x02, 0x01, 0x03, 0x02, 0x01, 0x02});
+    auto p = over(data);
+
+    const auto opened = p.set();
+    CHECK(opened.has_value());
+    if (!opened) return;
+
+    auto children = *opened;
+    CHECK(children.unsigned_integer() == 1u);
+    CHECK(children.unsigned_integer() == 3u);
+    CHECK(!children.unsigned_integer().has_value());
+    CHECK(children.failure() == error::unsorted_set);
+}
+
 // The comparison is of encodings, so the tag byte decides before the value does.
 void a_set_is_sorted_by_its_encodings_not_by_its_values() {
     // SET { INTEGER 2, OCTET STRING "A" } — 0x02 opens before 0x04.
@@ -175,6 +193,29 @@ void set_ordering_holds_through_a_plain_descent() {
     CHECK(inner.next().has_value());
     CHECK(!inner.next().has_value());
     CHECK(inner.failure() == error::unsorted_set);
+}
+
+// The rule belongs to the set, not to everything inside it: a SEQUENCE that is a
+// set's child keeps the order its schema gave it.
+void set_ordering_does_not_reach_into_a_child() {
+    // SET { SEQUENCE { INTEGER 2, INTEGER 1 } }
+    const auto data = bytes({0x31, 0x08, 0x30, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01});
+    auto p = over(data);
+
+    const auto opened = p.set();
+    CHECK(opened.has_value());
+    if (!opened) return;
+
+    auto children = *opened;
+    const auto child = children.expect(tag::sequence);
+    CHECK(child.has_value());
+    if (!child) return;
+
+    auto inner = children.into(*child);
+    CHECK(inner.unsigned_integer() == 2u);
+    CHECK(inner.unsigned_integer() == 1u);
+    CHECK(inner.at_end());
+    CHECK(children.at_end());
 }
 
 // A SEQUENCE's order is the schema's, not the encoding's.
@@ -239,9 +280,11 @@ int main() {
     a_child_the_caller_did_not_read_is_trailing_data();
     a_set_in_order_is_accepted();
     a_set_out_of_order_is_refused();
+    ordering_is_measured_against_the_element_before();
     a_set_is_sorted_by_its_encodings_not_by_its_values();
     a_set_may_repeat_an_encoding();
     set_ordering_holds_through_a_plain_descent();
+    set_ordering_does_not_reach_into_a_child();
     a_sequence_keeps_the_order_it_was_written_in();
     a_set_is_not_a_sequence();
     an_element_carries_its_own_encoding();
