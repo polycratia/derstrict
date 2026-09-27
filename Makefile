@@ -10,8 +10,10 @@ test:
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_derstrict.cpp -o build/tests
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_walkers.cpp -o build/tests_walkers
+	$(CXX) $(CXXFLAGS) $(SAN) tests/test_time.cpp -o build/tests_time
 	./build/tests
 	./build/tests_walkers
+	./build/tests_time
 
 demo:
 	@mkdir -p build

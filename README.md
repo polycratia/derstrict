@@ -31,6 +31,11 @@ bytes after the element    refused: bytes remain after the element
 | Unterminated OID arcs | A final byte with the continuation bit set. |
 | Padded OID arcs | An arc is a base-128 number, and base 128 has no leading zero digit any more than base ten does: `0x80 0x01` and `0x01` are one arc written two ways. |
 | A dishonest unused-bits count | It counts the bits the last byte of a `BIT STRING` does not use, so it is at most seven, it is zero when there is no last byte, and the bits it counts are zero. |
+| A time without seconds | `9912312359Z` leaves a reader to decide whether the seconds are zero or merely unwritten. DER's times carry them. |
+| A time that is not `Z` | DER writes one zone. An offset, or a bare local time, is an instant two readers place differently depending on what they assume about the writer. |
+| Fractional seconds in a `UTCTime` | The type has no place for them. A `GeneralizedTime` may carry them, but not with a trailing zero, and not at all when they are zero — X.690 drops the point along with them. |
+| A comma decimal mark | BER's option. DER's decimal mark is the point. |
+| A date the calendar does not have | `February 30` is refused rather than rolled over into March or clamped to the 28th, which are two readings of one string. Hour `24` goes the same way: midnight is `000000` of the next day. |
 | High-tag-number form | Legal DER, but no field this reaches uses it — refused rather than guessed at. |
 
 ## Use
@@ -84,6 +89,14 @@ library owns no memory to write it into.
 `bit()` numbering them the way X.690 does: most significant bit of the first
 byte first.
 
+`utc_time()` and `generalized_time()` read a time only in the shape DER writes
+it, and `time()` reads either one, for the `CHOICE` a validity period is. `year`
+is the full year: a `GeneralizedTime` writes all four digits of it, and a
+`UTCTime` writes two, which have no century of their own and are read on the
+1950-2049 window X.509 fixes for them. A `GeneralizedTime`'s fractional digits
+come back where they lie, because how much of a fraction matters is a question
+the caller's schema answers and a number here would answer for it.
+
 Header-only, C++17, no allocation, no exceptions.
 
 ## What it is not
@@ -104,13 +117,13 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
-| Not yet | `UTCTime` and `GeneralizedTime`, string types with their character-set rules, context-specific tags |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime` checked digit by digit — seconds required, zone `Z`, one spelling of a fraction, and a date the calendar has — `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
+| Not yet | string types with their character-set rules, context-specific tags |
 
 ## Development
 
 ```bash
-make test   # 255 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 349 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make demo
 ```
 

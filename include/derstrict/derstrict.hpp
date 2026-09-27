@@ -17,6 +17,9 @@
 //   * non-minimal OID arcs    — 0x80 0x01 pads an arc that already fits
 //   * lying unused-bit counts — a bit string that leaves set bits unused
 //   * unsorted set elements   — DER sorts a set's elements by their encodings
+//   * loose time strings      — missing seconds, a zone that is not Z, a
+//                               fraction with a second spelling, or a date the
+//                               calendar does not have
 //
 // Header-only, C++17, no allocation, no exceptions.
 #ifndef DERSTRICT_DERSTRICT_HPP
@@ -39,6 +42,8 @@ enum class tag : std::uint8_t {
     null_value = 0x05,
     object_identifier = 0x06,
     utf8_string = 0x0C,
+    utc_time = 0x17,
+    generalized_time = 0x18,
     sequence = 0x30,  // constructed
     set = 0x31,       // constructed
 };
@@ -62,6 +67,13 @@ enum class error {
     unused_bits_without_content,
     non_zero_unused_bits,
     unsorted_set,
+    malformed_time,
+    time_not_digits,
+    time_missing_seconds,
+    time_not_zulu,
+    time_fractional_seconds,
+    non_minimal_time_fraction,
+    time_out_of_range,
     trailing_data,
 };
 
@@ -85,6 +97,13 @@ enum class error {
         case error::unused_bits_without_content: return "an empty bit string leaves unused bits that are not there";
         case error::non_zero_unused_bits: return "the bit string's unused bits are not zero";
         case error::unsorted_set: return "the set's elements are not in the order DER requires";
+        case error::malformed_time: return "the time is not the fixed shape DER writes";
+        case error::time_not_digits: return "a time field holds something that is not a digit";
+        case error::time_missing_seconds: return "the time leaves out its seconds";
+        case error::time_not_zulu: return "the time does not end in Z, the only zone DER writes";
+        case error::time_fractional_seconds: return "a UTCTime cannot carry fractional seconds";
+        case error::non_minimal_time_fraction: return "the fractional seconds end in a zero DER leaves out";
+        case error::time_out_of_range: return "a time field names a value the calendar does not have";
         case error::trailing_data: return "bytes remain after the element";
     }
     return "unknown";
@@ -194,6 +213,30 @@ struct bit_string {
         if (index >= bit_count()) return false;
         return (bytes[index / 8] & (0x80u >> (index % 8))) != 0;
     }
+};
+
+/// A UTCTime or GeneralizedTime taken apart, every field already checked to be
+/// digits and to name a date the calendar has.
+///
+/// `year` is the full year. A GeneralizedTime writes all four digits of it; a
+/// UTCTime writes two, which have no century of their own, so they are read on
+/// the 1950-2049 window X.509 fixes for them.
+///
+/// `fraction` is the digits after a GeneralizedTime's decimal point, pointing
+/// into the caller's buffer. What a fraction of a second means for a given
+/// field is the schema's business, and turning it into a number here would
+/// decide that and lose digits doing it.
+struct date_time {
+    std::uint16_t year = 0;
+    std::uint8_t month = 0;
+    std::uint8_t day = 0;
+    std::uint8_t hour = 0;
+    std::uint8_t minute = 0;
+    std::uint8_t second = 0;
+    const std::uint8_t* fraction = nullptr;
+    std::size_t fraction_digits = 0;
+
+    [[nodiscard]] bool has_fraction() const noexcept { return fraction_digits != 0; }
 };
 
 /// A cursor over a byte span: the only thing here that touches memory.
@@ -433,6 +476,34 @@ class parser {
         return out;
     }
 
+    /// Read a UTCTime. DER writes one shape of it — YYMMDDHHMMSSZ — so the
+    /// seconds are there, the zone is Z, and there is no fraction. Every other
+    /// spelling of the same instant is refused rather than normalised, because
+    /// normalising is where two readers pick different instants.
+    [[nodiscard]] std::optional<date_time> utc_time() noexcept {
+        const auto e = expect(tag::utc_time);
+        if (!e) return std::nullopt;
+        return decode_utc(*e);
+    }
+
+    /// Read a GeneralizedTime: YYYYMMDDHHMMSSZ, with the fractional seconds
+    /// X.690 does allow here, written the one way it allows them.
+    [[nodiscard]] std::optional<date_time> generalized_time() noexcept {
+        const auto e = expect(tag::generalized_time);
+        if (!e) return std::nullopt;
+        return decode_generalized(*e);
+    }
+
+    /// Read either time, for the CHOICE a validity period is written as. Each
+    /// is held to its own grammar, so taking both costs no strictness.
+    [[nodiscard]] std::optional<date_time> time() noexcept {
+        const auto e = next();
+        if (!e) return std::nullopt;
+        if (e->is(tag::utc_time)) return decode_utc(*e);
+        if (e->is(tag::generalized_time)) return decode_generalized(*e);
+        return fail_time(error::unexpected_tag);
+    }
+
   private:
     parser(const std::uint8_t* data, std::size_t size, bool sorted) noexcept
         : cur_(data, size), sorted_(sorted) {}
@@ -495,6 +566,145 @@ class parser {
         return true;
     }
 
+    [[nodiscard]] static bool digit(std::uint8_t c) noexcept { return c >= '0' && c <= '9'; }
+
+    [[nodiscard]] static bool all_digits(const std::uint8_t* at, std::size_t count) noexcept {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!digit(at[i])) return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] static unsigned field(const std::uint8_t* at, std::size_t count) noexcept {
+        unsigned value = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            value = value * 10 + static_cast<unsigned>(at[i] - '0');
+        }
+        return value;
+    }
+
+    /// Where the decimal mark is, or the length if there is none. Both marks are
+    /// looked for: the comma is BER's option, and finding it here is what lets
+    /// it be refused as a comma rather than as some stray byte.
+    [[nodiscard]] static std::size_t decimal_mark(const element& e) noexcept {
+        for (std::size_t i = 0; i < e.length; ++i) {
+            if (e.content[i] == '.' || e.content[i] == ',') return i;
+        }
+        return e.length;
+    }
+
+    /// DER writes one zone, Z. A local time, or an offset from one, is an
+    /// instant two readers place differently depending on what they assume
+    /// about the writer.
+    [[nodiscard]] bool ends_in_zulu(const element& e) noexcept {
+        if (e.length == 0) {
+            (void)fail(error::malformed_time);
+            return false;
+        }
+        if (e.content[e.length - 1] != 'Z') {
+            (void)fail(error::time_not_zulu);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] static bool leap_year(std::uint16_t year) noexcept {
+        return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    }
+
+    [[nodiscard]] static std::uint8_t days_in_month(std::uint16_t year,
+                                                   std::uint8_t month) noexcept {
+        static constexpr std::uint8_t lengths[12] = {31, 28, 31, 30, 31, 30,
+                                                    31, 31, 30, 31, 30, 31};
+        if (month == 2 && leap_year(year)) return 29;
+        return lengths[month - 1];
+    }
+
+    /// A date the calendar does not have is a string two readers place
+    /// differently: one rolls February 30th over into March, another clamps it
+    /// to the end of the month. Hour 24 is the same ambiguity, and X.690 writes
+    /// midnight as 000000 of the following day instead.
+    [[nodiscard]] bool in_calendar(const date_time& t) noexcept {
+        const bool fields_hold = t.month >= 1 && t.month <= 12 && t.day >= 1 && t.hour <= 23 &&
+                                 t.minute <= 59 && t.second <= 59;
+        if (!fields_hold || t.day > days_in_month(t.year, t.month)) {
+            (void)fail(error::time_out_of_range);
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::optional<date_time> decode_utc(const element& e) noexcept {
+        // The type has no fraction in it at all, so a decimal mark is reported
+        // as the fraction it opens rather than as a digit that is not one.
+        if (decimal_mark(e) != e.length) return fail_time(error::time_fractional_seconds);
+        if (!ends_in_zulu(e)) return std::nullopt;
+
+        const std::size_t digits = e.length - 1;
+        // YYMMDDHHMM is what a writer produces when it treats the seconds as
+        // optional, which leaves a reader to decide whether they are zero or
+        // unknown.
+        if (digits == 10) return fail_time(error::time_missing_seconds);
+        if (digits != 12) return fail_time(error::malformed_time);
+        if (!all_digits(e.content, digits)) return fail_time(error::time_not_digits);
+
+        const unsigned two_digit_year = field(e.content, 2);
+        date_time out{};
+        out.year = static_cast<std::uint16_t>(two_digit_year >= 50 ? 1900 + two_digit_year
+                                                                  : 2000 + two_digit_year);
+        out.month = static_cast<std::uint8_t>(field(e.content + 2, 2));
+        out.day = static_cast<std::uint8_t>(field(e.content + 4, 2));
+        out.hour = static_cast<std::uint8_t>(field(e.content + 6, 2));
+        out.minute = static_cast<std::uint8_t>(field(e.content + 8, 2));
+        out.second = static_cast<std::uint8_t>(field(e.content + 10, 2));
+        if (!in_calendar(out)) return std::nullopt;
+        return out;
+    }
+
+    [[nodiscard]] std::optional<date_time> decode_generalized(const element& e) noexcept {
+        if (!ends_in_zulu(e)) return std::nullopt;
+
+        const std::size_t body = e.length - 1;  // everything before the Z
+        const std::size_t mark = decimal_mark(e);
+        const bool fractional = mark < body;
+        // X.690 11.7.4 admits one decimal mark, the point.
+        if (fractional && e.content[mark] == ',') return fail_time(error::malformed_time);
+
+        const std::size_t whole = fractional ? mark : body;
+        if (whole != 14) {
+            // YYYYMMDDHHMM and YYYYMMDDHH are ISO times, fraction or no
+            // fraction, and neither ends on the field DER ends on.
+            if (whole == 12 || whole == 10) return fail_time(error::time_missing_seconds);
+            return fail_time(error::malformed_time);
+        }
+        if (!all_digits(e.content, whole)) return fail_time(error::time_not_digits);
+
+        date_time out{};
+        out.year = static_cast<std::uint16_t>(field(e.content, 4));
+        out.month = static_cast<std::uint8_t>(field(e.content + 4, 2));
+        out.day = static_cast<std::uint8_t>(field(e.content + 6, 2));
+        out.hour = static_cast<std::uint8_t>(field(e.content + 8, 2));
+        out.minute = static_cast<std::uint8_t>(field(e.content + 10, 2));
+        out.second = static_cast<std::uint8_t>(field(e.content + 12, 2));
+
+        if (fractional) {
+            const std::uint8_t* const digits = e.content + mark + 1;
+            const std::size_t count = body - mark - 1;
+            // A point that opens no digits is not a fraction at all.
+            if (count == 0) return fail_time(error::malformed_time);
+            if (!all_digits(digits, count)) return fail_time(error::time_not_digits);
+            // X.690 11.7.3: a fraction omits its trailing zeros, and a fraction
+            // of zero is omitted along with the point, so a final zero digit
+            // gives one instant a second encoding.
+            if (digits[count - 1] == '0') return fail_time(error::non_minimal_time_fraction);
+            out.fraction = digits;
+            out.fraction_digits = count;
+        }
+
+        if (!in_calendar(out)) return std::nullopt;
+        return out;
+    }
+
     /// Read a length and decide it entirely: form, minimality, and whether this
     /// span can cover the count. A value coming back from here is a length that
     /// has already been checked against the bytes that are really present.
@@ -536,6 +746,7 @@ class parser {
     std::optional<std::uint64_t> fail_value(error e) noexcept { return fail(e); }
     std::optional<std::string> fail_string(error e) noexcept { return fail(e); }
     std::optional<bit_string> fail_bits(error e) noexcept { return fail(e); }
+    std::optional<date_time> fail_time(error e) noexcept { return fail(e); }
 
     cursor cur_;
     const std::uint8_t* previous_ = nullptr;
