@@ -123,12 +123,22 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 ## Development
 
 ```bash
-make test   # 349 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # every check under AddressSanitizer and UndefinedBehaviorSanitizer
+make fuzz   # the corpus as seeds for libFuzzer; wants CXX=clang++
 make demo
 ```
 
 Every refusal above has a test built from hand-written bytes, because the whole
 value of this library is in what it declines to accept.
+
+`tests/corpus.hpp` carries that idea at document scale: encodings shaped after
+the certificates that have split parsers in the field — a length counted past
+the end, a BER indefinite length inside a DER document, bytes appended after the
+last element — each named with the refusal it is expected to earn, and each read
+to its end by a walk with no schema to lean on.
+`fuzz/fuzz_derstrict.cpp` reads arbitrary bytes that same way, so `make fuzz`
+starts from those encodings rather than from noise: an input that reads outside
+its buffer, or that reads two ways, is a crash.
 
 ## License
 
