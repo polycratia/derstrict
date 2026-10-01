@@ -17,6 +17,39 @@ oid ending mid-arc         refused: the object identifier ends mid-arc
 bytes after the element    refused: bytes remain after the element
 ```
 
+## What strict means
+
+Strictness here is a property of the encoding and of nothing else. Every refusal
+answers one question: are these the bytes DER defines for this value, or are
+they bytes some other encoding allows? Whether the value itself is a sensible
+one is a question for a schema, a clock, or a key, and none of those are here.
+
+Three rules follow from that, and the whole library is them applied field by
+field.
+
+**One encoding per value.** Where a second spelling of a value exists — a length
+written the long way, a padded OID arc, a fraction with a trailing zero, a set
+written in some other order — it is refused rather than normalised into the
+first. Normalising is the step where two readers can land on different values,
+and a reader that accepts both spellings accepts two documents where DER defines
+one.
+
+**Refuse, not repair.** A signature covers the bytes on the wire. A parser that
+repairs a document reads something nobody wrote and nobody signed, so the
+document it checks and the document it verified are no longer the same one. The
+only safe treatment of a malformed encoding is to stop at it.
+
+**Refuse, not guess.** Where DER leaves nothing to decide, a reader that decides
+anyway is inventing a meaning: a reserved length byte that announces no count, a
+multi-byte first OID subidentifier, an hour `24` that could be the end of one day
+or the start of the next. Each is refused under its own name — the `error` enum
+and `describe()` say which rule was broken — rather than read on an assumption
+about what the writer probably meant.
+
+The line is the element. Anything decidable from the bytes and X.690's rules for
+them — a tag, a length, a digit, an ordering — is decided here. Everything that
+needs to know what the bytes are *for* is not.
+
 ## What it refuses
 
 | | |
@@ -102,9 +135,15 @@ Header-only, C++17, no allocation, no exceptions.
 ## What it is not
 
 **Not an X.509 parser.** It reads the encoding, not the semantics. There is no
-certificate structure here, no chain building, no signature verification — those
-are much larger jobs and pretending otherwise would be the dangerous kind of
-convenience.
+certificate structure here, no chain building, no path validation, no signature
+verification, no revocation checking — those are much larger jobs and pretending
+otherwise would be the dangerous kind of convenience.
+
+**Not a verdict on a certificate.** A document that reads is well encoded, which
+is not the same as trustworthy: nothing here weighs a validity period against a
+clock, a name against a policy, a key against a size floor, or an extension
+against the `critical` flag it carries. Every certificate this library accepts
+still has to be judged, and the judging happens above it.
 
 **Not a general ASN.1 toolkit.** No schema compiler, no BER, no CER, no encoder.
 It reads the subset a certificate is built from and says so when it meets
