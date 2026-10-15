@@ -12,6 +12,9 @@
 //   * non-minimal lengths     — 0x81 0x05 says "five" the long way
 //   * lengths past the end    — refused before a content byte is read
 //   * padded integers         — a leading 0x00 or 0xFF the next byte implies
+//   * loose booleans          — true is 0xFF, and BER's other spellings of it
+//                               are a second encoding of one value
+//   * a NULL with content     — its value is its presence, so it has none
 //   * trailing bytes          — content after the outermost element
 //   * unterminated OID arcs   — a final byte with the continuation bit set
 //   * non-minimal OID arcs    — 0x80 0x01 pads an arc that already fits
@@ -56,6 +59,9 @@ enum class error {
     reserved_length,
     length_too_large,
     unexpected_tag,
+    malformed_boolean,
+    non_canonical_boolean,
+    malformed_null,
     padded_integer,
     sign_extended_integer,
     negative_integer,
@@ -86,6 +92,9 @@ enum class error {
         case error::reserved_length: return "0xFF is reserved and encodes no length at all";
         case error::length_too_large: return "the length does not fit in this platform's size type";
         case error::unexpected_tag: return "a different tag was required here";
+        case error::malformed_boolean: return "a boolean is exactly one content byte";
+        case error::non_canonical_boolean: return "0x00 and 0xFF are the only booleans DER writes";
+        case error::malformed_null: return "a null has no content bytes";
         case error::padded_integer: return "the integer carries a leading zero that is not a sign byte";
         case error::sign_extended_integer: return "the integer repeats a sign byte its next byte already implies";
         case error::negative_integer: return "the integer is negative and an unsigned value was required";
@@ -384,6 +393,31 @@ class parser {
     /// Require that nothing follows. A document with trailing bytes has been
     /// interpreted by somebody differently from you.
     [[nodiscard]] bool at_end() noexcept { return cur_.at_end(); }
+
+    /// Read a BOOLEAN: one content byte, 0x00 for false and 0xFF for true.
+    /// BER reads every non-zero byte as true, so 0x01 is a second spelling of a
+    /// value that already has one, and taking it would accept 255 documents
+    /// where DER defines two.
+    [[nodiscard]] std::optional<bool> boolean() noexcept {
+        const auto e = expect(tag::boolean);
+        if (!e) return std::nullopt;
+        if (e->length != 1) return fail_bool(error::malformed_boolean);
+        if (e->content[0] == 0x00) return false;
+        if (e->content[0] == 0xFF) return true;
+        return fail_bool(error::non_canonical_boolean);
+    }
+
+    /// Read a NULL, whose value is its presence: DER writes no content bytes
+    /// for it, so a byte inside one carries something the type cannot say.
+    [[nodiscard]] bool null_value() noexcept {
+        const auto e = expect(tag::null_value);
+        if (!e) return false;
+        if (e->length != 0) {
+            (void)fail(error::malformed_null);
+            return false;
+        }
+        return true;
+    }
 
     /// Read an INTEGER of any width or sign as a view of its encoding. Nothing
     /// is copied: a serial number stays where the caller put it.
@@ -744,6 +778,7 @@ class parser {
     std::nullopt_t fail(error e) noexcept { return cur_.fail(e); }
     std::optional<std::size_t> fail_size(error e) noexcept { return fail(e); }
     std::optional<std::uint64_t> fail_value(error e) noexcept { return fail(e); }
+    std::optional<bool> fail_bool(error e) noexcept { return fail(e); }
     std::optional<std::string> fail_string(error e) noexcept { return fail(e); }
     std::optional<bit_string> fail_bits(error e) noexcept { return fail(e); }
     std::optional<date_time> fail_time(error e) noexcept { return fail(e); }

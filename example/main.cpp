@@ -30,7 +30,7 @@ void read_algorithm(const char* label, const std::vector<std::uint8_t>& document
 
     auto inner = outer.into(*seq);
     const auto oid = inner.oid();
-    const bool complete = oid && inner.expect(derstrict::tag::null_value) && inner.at_end();
+    const bool complete = oid && inner.null_value() && inner.at_end();
     if (!complete) {
         std::printf("%-26s refused: %s\n", label, derstrict::describe(inner.failure()));
         return;
@@ -60,6 +60,10 @@ int main() {
     read_algorithm("oid ending mid-arc",
                    bytes({0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01,
                           0x8B, 0x05, 0x00}));
+
+    read_algorithm("null carrying content",
+                   bytes({0x30, 0x0E, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01,
+                          0x0B, 0x05, 0x01, 0x00}));
 
     read_algorithm("bytes after the element",
                    bytes({0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01,
