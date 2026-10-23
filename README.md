@@ -14,6 +14,7 @@ well formed                accepted: 1.2.840.113549.1.1.11
 indefinite length          refused: indefinite length is BER, not DER
 length written long-form   refused: the length is encoded the long way
 oid ending mid-arc         refused: the object identifier ends mid-arc
+null carrying content      refused: a null has no content bytes
 bytes after the element    refused: bytes remain after the element
 ```
 
@@ -59,6 +60,8 @@ needs to know what the bytes are *for* is not.
 | Reserved length (`0xFF`) | X.690 reserves it, so it announces no byte count at all. Reading it as "127 length bytes follow" would be a parser inventing a meaning. |
 | A length past the end | Measured against the enclosing element before any content is read, so an inner element cannot reach into bytes its parent does not cover. |
 | Padded integers | A leading `0x00` is a sign byte only in front of a set top bit, and a leading `0xFF` is sign extension only in front of a clear one. Anywhere else the byte gives one number two encodings. |
+| A boolean in another spelling | DER writes `0x00` and `0xFF`, and BER reads every non-zero byte as true. Taking `0x01` as well would read 255 encodings as the two DER defines. |
+| A `NULL` with content | Its value is its presence, so DER writes no content bytes for it. Any byte inside one — a zero included, which reads like an empty value and is not one — carries something the type cannot hold. |
 | Trailing data | Bytes after the last element — of the document, or of the content of a constructed element a walk has finished — mean somebody else read this document differently from you. |
 | Unsorted set elements | The order of a `SET`'s components carries no meaning, so DER fixes one: ascending by encoding, compared as octet strings. A reader that takes any order takes several documents where DER defines one. |
 | Unterminated OID arcs | A final byte with the continuation bit set. |
@@ -111,6 +114,9 @@ into the caller's buffer: nothing is copied and nothing is owned, and
 `encoding()` widens that view back over the tag and length bytes, which is what
 DER orders a set by.
 
+`boolean()` and `null_value()` read the two types whose content DER fixes
+completely: one byte that is `0x00` or `0xFF`, and no bytes at all.
+
 `unsigned_integer()` is for the small fields. `integer()` reads one of any width
 or sign and hands back a view of the encoding: `negative()`, and `magnitude()`
 for a non-negative value's bytes where they already lie. A negative value's
@@ -156,7 +162,7 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime` checked digit by digit — seconds required, zone `Z`, one spelling of a fraction, and a date the calendar has — `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `BOOLEAN` and `NULL` as the content DER fixes completely — one byte of `0x00` or `0xFF`, and no bytes at all — `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime` checked digit by digit — seconds required, zone `Z`, one spelling of a fraction, and a date the calendar has — `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
 | Not yet | string types with their character-set rules, context-specific tags |
 
 ## Development

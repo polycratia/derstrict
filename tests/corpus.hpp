@@ -79,6 +79,10 @@ class reader {
         // and a walk that only called next() would never reach them.
         const std::uint8_t raw_tag = data[size - p.remaining()];
         switch (raw_tag) {
+            case 0x01: {
+                (void)p.boolean();
+                break;
+            }
             case 0x02: {
                 const auto number = p.integer();
                 if (!number) break;
@@ -90,6 +94,10 @@ class reader {
                 const auto value_bits = p.bits();
                 if (!value_bits) break;
                 for (std::size_t i = 0; i < value_bits->bit_count(); ++i) (void)value_bits->bit(i);
+                break;
+            }
+            case 0x05: {
+                (void)p.null_value();
                 break;
             }
             case 0x06: {
@@ -152,6 +160,12 @@ inline std::vector<sample> malformed() {
          of({0x30, 0x03, 0x02, 0x01, 0x01, 0x05, 0x00}), error::trailing_data},
         {"a byte smuggled after the last child", of({0x30, 0x04, 0x02, 0x01, 0x01, 0x00}),
          error::truncated},
+        {"a boolean in bers spelling of true", of({0x01, 0x01, 0x01}),
+         error::non_canonical_boolean},
+        {"a boolean wider than one content byte", of({0x01, 0x02, 0x00, 0xFF}),
+         error::malformed_boolean},
+        {"a boolean with no content at all", of({0x01, 0x00}), error::malformed_boolean},
+        {"a null carrying a content byte", of({0x05, 0x01, 0x00}), error::malformed_null},
         {"an integer padded with a leading zero", of({0x02, 0x02, 0x00, 0x01}),
          error::padded_integer},
         {"an integer repeating its sign byte", of({0x02, 0x02, 0xFF, 0x80}),
@@ -200,6 +214,8 @@ inline std::vector<sample> accepted() {
         {"an octet string that needs the long form", filled(of({0x04, 0x81, 0x80}), 128),
          error::none},
         {"a negative serial number", of({0x02, 0x02, 0xFF, 0x01}), error::none},
+        {"the two booleans der writes",
+         of({0x30, 0x06, 0x01, 0x01, 0x00, 0x01, 0x01, 0xFF}), error::none},
         {"a generalized time with a fraction", timed(0x18, "19991231235959.5Z"), error::none},
     };
 }
