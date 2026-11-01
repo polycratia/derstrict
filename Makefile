@@ -12,11 +12,13 @@ FUZZ_SECONDS ?= 30
 test:
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_derstrict.cpp -o build/tests
+	$(CXX) $(CXXFLAGS) $(SAN) tests/test_identifier.cpp -o build/tests_identifier
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_fixed.cpp -o build/tests_fixed
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_walkers.cpp -o build/tests_walkers
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_time.cpp -o build/tests_time
 	$(CXX) $(CXXFLAGS) $(SAN) tests/test_corpus.cpp -o build/tests_corpus
 	./build/tests
+	./build/tests_identifier
 	./build/tests_fixed
 	./build/tests_walkers
 	./build/tests_time

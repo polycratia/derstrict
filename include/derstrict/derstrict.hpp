@@ -11,6 +11,9 @@
 //   * indefinite lengths      — BER only; a DER document cannot contain one
 //   * non-minimal lengths     — 0x81 0x05 says "five" the long way
 //   * lengths past the end    — refused before a content byte is read
+//   * misformed universals    — a constructed INTEGER or OCTET STRING, a
+//                               primitive SEQUENCE: forms X.690 does not give
+//                               those numbers
 //   * padded integers         — a leading 0x00 or 0xFF the next byte implies
 //   * loose booleans          — true is 0xFF, and BER's other spellings of it
 //                               are a second encoding of one value
@@ -51,6 +54,64 @@ enum class tag : std::uint8_t {
     set = 0x31,       // constructed
 };
 
+/// The two bits an identifier octet opens with: whose numbering the tag was
+/// taken from. A universal number is X.680's, so X.680 says what the type is.
+/// The other three classes are numbered by whoever wrote the schema, which is
+/// why an element of one of them is asked for by number rather than recognised
+/// by its byte.
+enum class tag_class : std::uint8_t {
+    universal = 0x00,
+    application = 0x40,
+    context_specific = 0x80,
+    private_class = 0xC0,
+};
+
+/// Whether X.680 gives this universal tag number exactly one form — true for a
+/// constructed type, false for a primitive one — and nothing for a number no
+/// type has been assigned. Fixing a form for an unassigned number would be
+/// refusing on an assumption instead of on a rule.
+[[nodiscard]] inline std::optional<bool> universal_form(std::uint8_t number) noexcept {
+    switch (number) {
+        // Primitive: the types whose content is the value itself. BER may cut a
+        // BIT STRING or an OCTET STRING into fragments under a constructed tag;
+        // DER writes one unfragmented string, so that form is not here either.
+        case 1:   // BOOLEAN
+        case 2:   // INTEGER
+        case 3:   // BIT STRING
+        case 4:   // OCTET STRING
+        case 5:   // NULL
+        case 6:   // OBJECT IDENTIFIER
+        case 7:   // ObjectDescriptor
+        case 9:   // REAL
+        case 10:  // ENUMERATED
+        case 12:  // UTF8String
+        case 13:  // RELATIVE-OID
+        case 14:  // TIME
+        case 18:  // NumericString
+        case 19:  // PrintableString
+        case 20:  // T61String
+        case 21:  // VideotexString
+        case 22:  // IA5String
+        case 23:  // UTCTime
+        case 24:  // GeneralizedTime
+        case 25:  // GraphicString
+        case 26:  // VisibleString
+        case 27:  // GeneralString
+        case 28:  // UniversalString
+        case 30:  // BMPString
+            return false;
+        // Constructed: the types that are made of other elements.
+        case 8:   // EXTERNAL
+        case 11:  // EMBEDDED PDV
+        case 16:  // SEQUENCE, SEQUENCE OF
+        case 17:  // SET, SET OF
+        case 29:  // CHARACTER STRING
+            return true;
+        default:
+            return std::nullopt;
+    }
+}
+
 enum class error {
     none,
     truncated,
@@ -59,6 +120,7 @@ enum class error {
     reserved_length,
     length_too_large,
     unexpected_tag,
+    wrong_tag_form,
     malformed_boolean,
     non_canonical_boolean,
     malformed_null,
@@ -92,6 +154,7 @@ enum class error {
         case error::reserved_length: return "0xFF is reserved and encodes no length at all";
         case error::length_too_large: return "the length does not fit in this platform's size type";
         case error::unexpected_tag: return "a different tag was required here";
+        case error::wrong_tag_form: return "a universal tag is in a form X.690 does not give it";
         case error::malformed_boolean: return "a boolean is exactly one content byte";
         case error::non_canonical_boolean: return "0x00 and 0xFF are the only booleans DER writes";
         case error::malformed_null: return "a null has no content bytes";
@@ -129,7 +192,25 @@ struct element {
     [[nodiscard]] bool is(tag expected) const noexcept {
         return raw_tag == static_cast<std::uint8_t>(expected);
     }
+
+    /// The three fields the identifier octet is made of: whose numbering the
+    /// tag came from, whether its content is other elements, and the number.
+    [[nodiscard]] tag_class element_class() const noexcept {
+        return static_cast<tag_class>(raw_tag & 0xC0);
+    }
     [[nodiscard]] bool constructed() const noexcept { return (raw_tag & 0x20) != 0; }
+    [[nodiscard]] std::uint8_t number() const noexcept { return raw_tag & 0x1F; }
+
+    [[nodiscard]] bool universal() const noexcept {
+        return element_class() == tag_class::universal;
+    }
+
+    /// Whether this is the context-specific `[wanted]` a schema asked for. Such
+    /// a number means nothing without the schema that chose it, so it is asked
+    /// for by class and number rather than matched as a byte.
+    [[nodiscard]] bool is_context(std::uint8_t wanted) const noexcept {
+        return element_class() == tag_class::context_specific && number() == wanted;
+    }
 
     /// The element as it was written, tag and length bytes included: DER orders
     /// a SET by these bytes and not by the values behind them.
@@ -344,6 +425,17 @@ class parser {
         // this parser reaches uses it, so it is refused rather than guessed at.
         if ((out.raw_tag & 0x1F) == 0x1F) return fail(error::unexpected_tag);
 
+        // A universal number is X.680's, and X.680 gives each of its types one
+        // form. A constructed INTEGER is BER's fragmentation of a type that
+        // cannot be fragmented, or a tag that is not an INTEGER at all; a
+        // primitive SEQUENCE claims a value where there are children. Either
+        // way the element is not the one its number names, and that is settled
+        // on the identifier octet, so every walk meets it — typed or not.
+        if (out.universal()) {
+            const auto one_form = universal_form(out.number());
+            if (one_form && *one_form != out.constructed()) return fail(error::wrong_tag_form);
+        }
+
         // The length is settled before a content byte is touched: what comes
         // back from here is a count this span can already cover.
         const auto length = read_length();
@@ -365,6 +457,18 @@ class parser {
         const auto found = next();
         if (!found) return std::nullopt;
         if (!found->is(wanted)) return fail(error::unexpected_tag);
+        return found;
+    }
+
+    /// Read a context-specific `[wanted]`: the tag a schema puts on an optional
+    /// or alternative field. The number is the schema's, so the element is
+    /// asked for by class and number instead of matched as a tag byte. Either
+    /// form is taken, because whether `[n]` wraps an element or retags one is
+    /// the schema's choice and the encoding does not record which.
+    [[nodiscard]] std::optional<element> context(std::uint8_t wanted) noexcept {
+        const auto found = next();
+        if (!found) return std::nullopt;
+        if (!found->is_context(wanted)) return fail(error::unexpected_tag);
         return found;
     }
 
