@@ -72,6 +72,7 @@ needs to know what the bytes are *for* is not.
 | Fractional seconds in a `UTCTime` | The type has no place for them. A `GeneralizedTime` may carry them, but not with a trailing zero, and not at all when they are zero — X.690 drops the point along with them. |
 | A comma decimal mark | BER's option. DER's decimal mark is the point. |
 | A date the calendar does not have | `February 30` is refused rather than rolled over into March or clamped to the 28th, which are two readings of one string. Hour `24` goes the same way: midnight is `000000` of the next day. |
+| A universal tag in the wrong form | X.680 gives each of its types one form, so a number and a form that disagree name no type: a constructed `INTEGER` or `OCTET STRING` is BER's fragmentation of a value DER writes whole, and a primitive `SEQUENCE` claims a value where there are children. The identifier octet decides it, so a walk with no schema refuses it too. |
 | High-tag-number form | Legal DER, but no field this reaches uses it — refused rather than guessed at. |
 
 ## Use
@@ -106,6 +107,23 @@ claims to be and refused for not being one, rather than stepped over. A child
 the caller never asked for is refused by `at_end()` for the same reason. A
 `SET`'s children carry DER's ordering rule with them, and `into()` carries it
 too, so a descent written by hand is no less strict than one through `set()`.
+
+An element hands back the identifier octet taken apart: `element_class()`,
+`constructed()` and `number()`. A universal number is X.680's, so the form is
+held to the one X.680 gives that number, and that is decided on the octet itself
+— before a typed read weighs the tag it wanted, and in an untyped walk that has
+no schema to say what the element should have been. The other three classes are
+numbered by whoever wrote the schema, and the schema picks the form too, so a
+`[n]` is asked for by class and number rather than matched as a byte, in either
+form:
+
+```cpp
+const auto version = fields.context(0);   // [0], wrapping an element or retagging one
+if (version) {
+    auto held = fields.into(*version);
+    const auto number = held.unsigned_integer();
+}
+```
 
 Failures are sticky, so a run of reads can be checked once. `remaining()` is the
 exact number of bytes not yet read — it never underflows, and it is zero once a
@@ -162,8 +180,8 @@ It is for the case where the alternative is a hand-rolled loop over a buffer.
 
 | | |
 |---|---|
-| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, strict length rules decided before any content is read, `BOOLEAN` and `NULL` as the content DER fixes completely — one byte of `0x00` or `0xFF`, and no bytes at all — `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime` checked digit by digit — seconds required, zone `Z`, one spelling of a fraction, and a date the calendar has — `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
-| Not yet | string types with their character-set rules, context-specific tags |
+| Implemented | a cursor with a sticky error and an exact `remaining()`, tag-length-value reading, the identifier octet split into class, form and number — a universal number held to the one form X.680 gives it, in untyped walks too, and a context-specific `[n]` asked for by class and number — strict length rules decided before any content is read, `BOOLEAN` and `NULL` as the content DER fixes completely — one byte of `0x00` or `0xFF`, and no bytes at all — `INTEGER` as unsigned 64-bit or as a big-integer view of any width and either sign, `OBJECT IDENTIFIER` in dotted form with minimal arcs, `BIT STRING` with its unused-bits byte, `UTCTime` and `GeneralizedTime` checked digit by digit — seconds required, zone `Z`, one spelling of a fraction, and a date the calendar has — `SEQUENCE` and `SET` walkers that refuse bytes left after the last child and check DER's set ordering as the children are read, end-of-input enforcement |
+| Not yet | string types with their character-set rules, a way to say which `[n]` a schema expects where |
 
 ## Development
 

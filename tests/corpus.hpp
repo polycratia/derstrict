@@ -187,6 +187,16 @@ inline std::vector<sample> malformed() {
          error::non_zero_unused_bits},
         {"a set written out of order", of({0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01}),
          error::unsorted_set},
+        // The form rule is settled on the identifier octet, so this walk — which
+        // has no schema to say what the element should have been — refuses these
+        // under their own error rather than reading them as the type their
+        // number names.
+        {"a constructed integer", of({0x22, 0x03, 0x02, 0x01, 0x01}), error::wrong_tag_form},
+        {"a fragmented octet string",
+         of({0x24, 0x06, 0x04, 0x01, 0x41, 0x04, 0x01, 0x42}), error::wrong_tag_form},
+        {"a primitive sequence", of({0x10, 0x03, 0x02, 0x01, 0x01}), error::wrong_tag_form},
+        {"a constructed integer inside a sequence",
+         of({0x30, 0x05, 0x22, 0x03, 0x02, 0x01, 0x01}), error::wrong_tag_form},
         {"a tag in the high tag number form", of({0x1F, 0x81, 0x00, 0x01, 0x00}),
          error::unexpected_tag},
         {"a time without its seconds", timed(0x17, "2501011200Z"), error::time_missing_seconds},
@@ -217,6 +227,11 @@ inline std::vector<sample> accepted() {
         {"the two booleans der writes",
          of({0x30, 0x06, 0x01, 0x01, 0x00, 0x01, 0x01, 0xFF}), error::none},
         {"a generalized time with a fraction", timed(0x18, "19991231235959.5Z"), error::none},
+        // A schema picks the form of its own tags, so both of these are written,
+        // and the form rule reaches neither.
+        {"a constructed context specific element",
+         of({0x30, 0x05, 0xA0, 0x03, 0x02, 0x01, 0x01}), error::none},
+        {"a primitive context specific element", of({0x30, 0x03, 0x82, 0x01, 0x41}), error::none},
     };
 }
 
